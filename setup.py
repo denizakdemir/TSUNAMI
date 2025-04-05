@@ -11,8 +11,8 @@ with open("README.md", "r") as fh:
 setup(
     name="enhanced_deephit",
     version="0.1.0",
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="Deniz Akdemir",
+    author_email="denizakdemir@example.com",
     description="A comprehensive tabular transformer architecture for advanced survival analysis",
     long_description=long_description,
     long_description_content_type="text/markdown",

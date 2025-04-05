@@ -146,7 +146,7 @@ If you use TSUNAMI in your research, please cite:
 
 ```
 @misc{tsunami2023,
-  author = {Your Name},
+  author = {Deniz Akdemir},
   title = {TSUNAMI: Tabular SUrviVal aNAlytics with Multiple targets and Imputation},
   year = {2023},
   publisher = {GitHub},
