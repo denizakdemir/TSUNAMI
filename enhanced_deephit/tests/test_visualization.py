@@ -115,11 +115,45 @@ class TestVisualizationFunctions(unittest.TestCase):
         self.target_tensor = torch.tensor(self.target, dtype=torch.float32)
         self.cr_target_tensor = torch.tensor(self.cr_target, dtype=torch.float32)
         
-        # Create datasets and dataloaders
-        dataset = TensorDataset(self.X_tensor, self.target_tensor)
-        self.loader = DataLoader(dataset, batch_size=32)
+        # Create datasets and dataloaders with proper formatting
+        # The model expects a dictionary with 'continuous' and 'targets' keys
+        class SurvivalDataset(torch.utils.data.Dataset):
+            def __init__(self, X, targets):
+                self.X = X
+                self.targets = targets
+                
+            def __len__(self):
+                return len(self.X)
+                
+            def __getitem__(self, idx):
+                return {
+                    'continuous': self.X[idx],
+                    'targets': {
+                        'survival': self.targets[idx]
+                    }
+                }
+                
+        class CompetingRisksDataset(torch.utils.data.Dataset):
+            def __init__(self, X, targets):
+                self.X = X
+                self.targets = targets
+                
+            def __len__(self):
+                return len(self.X)
+                
+            def __getitem__(self, idx):
+                return {
+                    'continuous': self.X[idx],
+                    'targets': {
+                        'competing_risks': self.targets[idx]
+                    }
+                }
         
-        cr_dataset = TensorDataset(self.X_tensor, self.cr_target_tensor)
+        # Create the custom datasets
+        survival_dataset = SurvivalDataset(self.X_tensor, self.target_tensor)
+        self.loader = DataLoader(survival_dataset, batch_size=32)
+        
+        cr_dataset = CompetingRisksDataset(self.X_tensor, self.cr_target_tensor)
         self.cr_loader = DataLoader(cr_dataset, batch_size=32)
         
         # Create single risk model

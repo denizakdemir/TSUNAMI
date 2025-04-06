@@ -119,9 +119,24 @@ class SingleRiskHead(TaskHead):
         hazards = torch.clamp(hazards, 0, 1)
         hazards = torch.nan_to_num(hazards, nan=0.5)
         
-        # Compute survival function (cumulative product of 1 - hazard)
-        # S(t) = \prod_{j=1}^{t} (1 - h(j))
-        survival = torch.cumprod(1 - hazards, dim=1)
+        # Compute survival function based on the discrete-time survival model
+        # In discrete time:
+        # S(0) = 1 (by definition)
+        # S(t) = Prob(T > t) = Prob(not failing at times 1, 2, ..., t)
+        # S(t) = (1-h(1)) * (1-h(2)) * ... * (1-h(t)) for t >= 1
+        
+        # Calculate survival probabilities at each time point
+        # First compute (1 - hazard) for each time point
+        survival_probs = 1 - hazards
+        
+        # Initialize survival with ones for S(0)
+        batch_size = hazards.size(0)
+        num_time_bins = hazards.size(1)
+        survival = torch.ones(batch_size, num_time_bins, device=hazards.device)
+        
+        # Compute S(t) using the correct definition
+        # S(t) = product from j=1 to t of (1-h(j))
+        survival[:, 1:] = torch.cumprod(survival_probs[:, :-1], dim=1)
         
         # Compute overall risk score (negative expected survival time)
         risk_score = -torch.sum(survival, dim=1)
@@ -799,28 +814,42 @@ class CompetingRisksHead(TaskHead):
             # Probability of no event = probability of not having any of the events
             no_event_prob = torch.prod(1 - cause_hazards, dim=1)
         
-        # Compute overall survival function
-        # S(t) = \prod_{j=1}^{t} (probability of no event at time j)
-        overall_survival = torch.cumprod(no_event_prob, dim=1)
+        # Compute overall survival function based on the discrete-time survival model
+        # In discrete time:
+        # S(0) = 1 (by definition)
+        # S(t) = Prob(T > t) = Prob(no event at times 1, 2, ..., t)
+        # S(t) = (1-h_total(1)) * (1-h_total(2)) * ... * (1-h_total(t)) for t >= 1
+        # where h_total(t) = probability of any event at time t
+        
+        # Initialize overall survival with ones for S(0)
+        overall_survival = torch.ones(batch_size, self.num_time_bins, device=device)
+        
+        # Compute S(t) using the correct definition
+        # S(t) = product from j=1 to t of (no_event_prob(j))
+        overall_survival[:, 1:] = torch.cumprod(no_event_prob[:, :-1], dim=1)
         
         # Compute cumulative incidence functions for each cause
-        # CIF_k(t) = \sum_{j=1}^{t} S(j-1) * cause_hazards_k(j)
+        # In the competing risks setting:
+        # F_k(t) = Prob(T ≤ t, Cause = k) = probability of event of type k by time t
+        # F_k(0) = 0 (by definition, no events at time 0)
+        # F_k(t) = sum from j=1 to t of S(j-1) * h_k(j)
+        # Where h_k(j) is the cause-specific hazard for cause k at time j
+        
         # Initialize CIF starting at 0 for all risks
         cif = torch.zeros(batch_size, self.num_risks, self.num_time_bins, device=device)
         
-        # Calculate CIF for each time point
-        for t in range(self.num_time_bins):
-            # Survival up to previous time point
-            prev_survival = torch.ones(batch_size, device=device) if t == 0 else overall_survival[:, t-1]
+        # By definition, F_k(0) = 0 (no events at time 0)
+        # For t ≥ 1, compute CIF using correct formula
+        for t in range(1, self.num_time_bins):
+            # Get survival up to time t-1
+            prev_survival = overall_survival[:, t-1]
             
-            # Probability of event of each type at time t
-            event_probs = cause_hazards[:, :, t] * prev_survival.unsqueeze(1)
+            # Calculate probability of event of type k at time t
+            # P(T=t, Cause=k) = S(t-1) * h_k(t)
+            event_probs = cause_hazards[:, :, t-1] * prev_survival.unsqueeze(1)
             
-            # Add to cumulative incidence (start from 0)
-            if t == 0:
-                cif[:, :, t] = event_probs
-            else:
-                cif[:, :, t] = cif[:, :, t-1] + event_probs
+            # Add to cumulative incidence
+            cif[:, :, t] = cif[:, :, t-1] + event_probs
         
         # Compute cause-specific risk scores (negative expected survival time for each cause)
         risk_scores = torch.sum(cif, dim=2)
