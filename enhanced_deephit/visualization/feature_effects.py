@@ -159,7 +159,11 @@ def plot_partial_dependence(
             
             for idx in category_indices:
                 # Convert index to actual category value for label
-                category_labels.append(str(reverse_mapping[idx]))
+                # Make sure we display the original categorical label, not its numeric representation
+                original_label = reverse_mapping[idx]
+                # If the original label is a number or any other type, ensure it's displayed as a string
+                # This ensures we see the actual category names like "Male"/"Female" not index values
+                category_labels.append(str(original_label))
                 
                 # Create a copy of the data - all embedding dimensions must be set appropriately
                 # For simplicity, we'll use one-hot style embedding initialization
@@ -211,7 +215,8 @@ def plot_partial_dependence(
             x_pos = np.arange(len(category_labels))
             ax.bar(x_pos, pd_values, alpha=0.7)
             
-            # Set x-axis labels to category names
+            # Set x-axis labels to actual category names, not internal indices
+            # Make sure we're showing the original category values, not numeric codes
             ax.set_xticks(x_pos)
             ax.set_xticklabels(category_labels, rotation=45, ha='right')
             
@@ -222,12 +227,17 @@ def plot_partial_dependence(
                 for val in feature_values:
                     # Determine which category this value corresponds to
                     # For simplicity, find closest category index
+                    # Find the closest category index
                     closest_idx = min(category_indices, key=lambda x: abs(val - x/categorical_info.get('cardinality', 1)))
+                    # Get the original category label from the reverse mapping
                     cat = reverse_mapping.get(closest_idx, 'Unknown')
+                    # Convert to string to ensure consistent handling
+                    cat = str(cat)
                     counts[cat] = counts.get(cat, 0) + 1
                 
                 # Plot distribution
-                dist_values = [counts.get(reverse_mapping.get(idx, 'Unknown'), 0) for idx in category_indices]
+                # Convert all mapped values to strings for consistency when looking up in counts dictionary
+                dist_values = [counts.get(str(reverse_mapping.get(idx, 'Unknown')), 0) for idx in category_indices]
                 total = sum(dist_values)
                 dist_values = [v/total for v in dist_values] if total > 0 else dist_values
                 
