@@ -448,7 +448,7 @@ def _compute_continuous_dependence(
         X_modified = X.clone()
         
         # Replace the feature with the current value
-        X_modified[:, feature_idx] = value
+        X_modified[:, feature_idx] = float(value)
         
         # Get predictions
         with torch.no_grad():
@@ -634,7 +634,7 @@ def plot_ice_curves(
         
         # Set feature values
         for j in range(n_points):
-            X_instance[j, feature_idx] = grid_values[j]
+            X_instance[j, feature_idx] = float(grid_values[j])
         
         # Get predictions
         with torch.no_grad():
@@ -871,8 +871,8 @@ def plot_feature_interaction(
             X_modified = torch.mean(X, dim=0, keepdim=True).repeat(1, 1)
             
             # Set feature values
-            X_modified[0, feature1_idx] = grid1[i]
-            X_modified[0, feature2_idx] = grid2[j]
+            X_modified[0, feature1_idx] = float(grid1[i])
+            X_modified[0, feature2_idx] = float(grid2[j])
             
             # Get predictions
             with torch.no_grad():
@@ -1100,8 +1100,8 @@ def plot_effect_modifier(
             X_modified = X_base.clone()
             
             # Set feature values
-            X_modified[0, feature_idx] = feat_val
-            X_modified[0, modifier_idx] = mod_val
+            X_modified[0, feature_idx] = float(feat_val)
+            X_modified[0, modifier_idx] = float(mod_val)
             
             # Get predictions
             with torch.no_grad():

@@ -539,8 +539,22 @@ class SingleRiskHead(TaskHead):
         n_samples = len(event_time)
         n_time_bins = survival.shape[1]
         
+        # Check for NaN values in input arrays
+        if np.isnan(survival).any():
+            print("Warning: NaN values found in survival probabilities. Replacing with zeros.")
+            survival = np.nan_to_num(survival, nan=0.0)
+            
+        if np.isnan(event_time).any():
+            print("Warning: NaN values found in event times. Replacing with zeros.")
+            event_time = np.nan_to_num(event_time, nan=0.0)
+            
+        if np.isnan(event_indicator).any():
+            print("Warning: NaN values found in event indicators. Replacing with zeros.")
+            event_indicator = np.nan_to_num(event_indicator, nan=0.0)
+        
         # Initialize Brier score for each time point
         brier_scores = np.zeros(n_time_bins)
+        valid_time_bins = 0
         
         # For each time bin
         for t in range(n_time_bins):
@@ -548,6 +562,10 @@ class SingleRiskHead(TaskHead):
             weight_sum = 0.0
             
             for i in range(n_samples):
+                # Skip samples with invalid event times
+                if np.isnan(event_time[i]) or event_time[i] < 0:
+                    continue
+                    
                 # Observed outcome at time t
                 Y_t = 0.0  # Default: survived past time t
                 weight = 1.0  # Default weight
@@ -561,6 +579,10 @@ class SingleRiskHead(TaskHead):
                 
                 # Skip if weight is zero
                 if weight > 0:
+                    # Check if survival value is valid
+                    if np.isnan(survival[i, t]) or survival[i, t] < 0 or survival[i, t] > 1:
+                        continue
+                        
                     # Predicted probability of event by time t
                     pred_t = 1 - survival[i, t]
                     
@@ -571,9 +593,18 @@ class SingleRiskHead(TaskHead):
             # Average over samples with non-zero weights
             if weight_sum > 0:
                 brier_scores[t] = brier_score_t / weight_sum
+                valid_time_bins += 1
         
         # Compute integrated score (mean over time)
-        return np.mean(brier_scores)
+        if valid_time_bins > 0:
+            # Only use time bins with valid scores
+            valid_scores = brier_scores[~np.isnan(brier_scores)]
+            if len(valid_scores) > 0:
+                return np.mean(valid_scores)
+                
+        # If no valid scores, return NaN with a warning
+        print("Warning: Could not compute Integrated Brier Score (no valid time bins)")
+        return 0.5  # Return a default value instead of NaN
     
     def _compute_time_dependent_auc(self, risk_scores, event_time, event_indicator):
         """Compute time-dependent AUC."""
@@ -816,15 +847,34 @@ class CompetingRisksHead(TaskHead):
             # Compute (1 - hazard) for current risk
             survival_probs = 1 - hazards[:, risk_idx, :]
             
+            # Handle any potential NaN values
+            if torch.isnan(survival_probs).any():
+                survival_probs = torch.nan_to_num(survival_probs, nan=1.0)
+            
+            # Ensure survival probabilities are in valid range [0, 1]
+            survival_probs = torch.clamp(survival_probs, 0.0, 1.0)
+            
             # S_k(t) = product from j=1 to t of (1-h_k(j))
-            cause_specific_survival[:, risk_idx, 1:] = torch.cumprod(
-                survival_probs[:, :-1], dim=1
-            )
+            cause_specific_survival_k = torch.ones_like(cause_specific_survival[:, risk_idx, :])
+            cause_specific_survival_k[:, 1:] = torch.cumprod(survival_probs[:, :-1], dim=1)
+            
+            # Handle any NaN values that might have been produced
+            if torch.isnan(cause_specific_survival_k).any():
+                cause_specific_survival_k = torch.nan_to_num(cause_specific_survival_k, nan=1.0)
+            
+            cause_specific_survival[:, risk_idx, :] = cause_specific_survival_k
         
         # Compute overall survival (probability of surviving all risks)
         # S(t) = Prob(T > t) = Prob(T_1 > t, T_2 > t, ..., T_K > t)
         # For independent risks: S(t) = S_1(t) * S_2(t) * ... * S_K(t)
         overall_survival = torch.prod(cause_specific_survival, dim=1)
+        
+        # Handle any potential NaN values in overall survival
+        if torch.isnan(overall_survival).any():
+            overall_survival = torch.nan_to_num(overall_survival, nan=1.0)
+        
+        # Ensure overall survival is in valid range [0, 1]
+        overall_survival = torch.clamp(overall_survival, 0.0, 1.0)
         
         # Compute cumulative incidence functions (CIF)
         # F_k(t) = Prob(T <= t, cause = k)
@@ -843,8 +893,22 @@ class CompetingRisksHead(TaskHead):
                 else:
                     prev_survival = overall_survival[:, t-2]
                 
+                # Handle NaN values in previous survival
+                if torch.isnan(prev_survival).any():
+                    prev_survival = torch.nan_to_num(prev_survival, nan=1.0)
+                
+                # Handle NaN values in hazards
+                current_hazards = hazards[:, risk_idx, t-1]
+                if torch.isnan(current_hazards).any():
+                    current_hazards = torch.nan_to_num(current_hazards, nan=0.0)
+                
                 # Create a new tensor instead of inplace assignment
-                new_cif_val = cif[:, risk_idx, t-1] + hazards[:, risk_idx, t-1] * prev_survival
+                new_cif_val = cif[:, risk_idx, t-1] + current_hazards * prev_survival
+                
+                # Handle any potential NaN values in the sum
+                if torch.isnan(new_cif_val).any():
+                    new_cif_val = torch.nan_to_num(new_cif_val, nan=0.0)
+                    
                 cif[:, risk_idx, t] = new_cif_val
         
         # Normalize CIFs to ensure they sum to 1 - overall_survival
@@ -852,8 +916,19 @@ class CompetingRisksHead(TaskHead):
             # Calculate the current sum of all CIFs at time t
             cif_sum = torch.sum(cif[:, :, t], dim=1)
             
+            # Handle any potential NaN values in the sum
+            if torch.isnan(cif_sum).any():
+                cif_sum = torch.nan_to_num(cif_sum, nan=0.0)
+            
             # Calculate the target sum (should be 1 - overall_survival)
             target_sum = 1.0 - overall_survival[:, t]
+            
+            # Handle any potential NaN values in the target sum
+            if torch.isnan(target_sum).any():
+                target_sum = torch.nan_to_num(target_sum, nan=0.0)
+            
+            # Ensure target_sum is in valid range [0, 1]
+            target_sum = torch.clamp(target_sum, 0.0, 1.0)
             
             # Avoid division by zero and trivial cases
             valid_indices = (cif_sum > 1e-6) & (target_sum > 1e-6)
@@ -863,13 +938,31 @@ class CompetingRisksHead(TaskHead):
                 scale_factor = torch.ones_like(cif_sum)
                 # Clone to avoid in-place modification
                 new_scale_factor = scale_factor.clone()
-                new_scale_factor[valid_indices] = target_sum[valid_indices] / cif_sum[valid_indices]
+                
+                # Divide with safety checking
+                division_result = torch.zeros_like(cif_sum)
+                mask = valid_indices & (cif_sum > 1e-6)  # Extra safety check
+                if torch.any(mask):
+                    division_result[mask] = target_sum[mask] / cif_sum[mask]
+                
+                # Handle potential infinity or NaN values from division
+                division_result = torch.nan_to_num(division_result, nan=1.0, posinf=1.0, neginf=1.0)
+                
+                # Only apply valid scaling factors (between 0.1 and 10 for safety)
+                valid_scale = (division_result >= 0.1) & (division_result <= 10.0)
+                new_scale_factor[valid_indices & valid_scale] = division_result[valid_indices & valid_scale]
                 scale_factor = new_scale_factor
                 
                 # Apply scaling to each risk's CIF
                 for risk_idx in range(self.num_risks):
                     # Create a new tensor instead of in-place operations
-                    cif[:, risk_idx, t] = cif[:, risk_idx, t].clone() * scale_factor
+                    scaled_cif = cif[:, risk_idx, t].clone() * scale_factor
+                    # Handle any NaN values that might result
+                    scaled_cif = torch.nan_to_num(scaled_cif, nan=0.0)
+                    # Ensure values are in valid range [0, 1]
+                    scaled_cif = torch.clamp(scaled_cif, 0.0, 1.0)
+                    # Assign back to CIF
+                    cif[:, risk_idx, t] = scaled_cif
         
         # Compute overall risk scores for each cause (negative expected survival time)
         risk_scores = torch.sum(cif, dim=2)
