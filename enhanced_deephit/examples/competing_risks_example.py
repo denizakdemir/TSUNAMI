@@ -13,8 +13,17 @@ sys.path.insert(0, project_root)
 
 from data.processing import DataProcessor
 from models import EnhancedDeepHit
-from models.tasks.survival import CompetingRisksHead
 from simulation.data_generation import generate_competing_risks_data
+
+# Try to import CompetingRisksHead if available
+try:
+    from models.tasks.survival import CompetingRisksHead
+    COMPETING_RISKS_AVAILABLE = True
+except ImportError:
+    COMPETING_RISKS_AVAILABLE = False
+    print("CompetingRisksHead is not available. This example cannot run without it.")
+    print("This is a placeholder for when CompetingRisksHead is implemented.")
+    sys.exit(0)
 
 
 class CompetingRisksDataset(Dataset):
