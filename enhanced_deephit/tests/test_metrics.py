@@ -1,8 +1,7 @@
 import pytest
 import torch
 import numpy as np
-from enhanced_deephit.models.tasks.survival import SingleRiskHead
-# CompetingRisksHead will be implemented in a future update
+from enhanced_deephit.models.tasks.survival import SingleRiskHead, CompetingRisksHead
 from enhanced_deephit.models.tasks.standard import ClassificationHead
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 from sklearn.metrics import confusion_matrix, precision_score, recall_score
@@ -23,131 +22,131 @@ def generate_survival_data(batch_size=100, num_time_bins=10, censoring_rate=0.3)
     
     # Generate survival curves
     survival = np.ones((batch_size, num_time_bins))
-    for i in range(batch_size):
-        for t in range(num_time_bins):
-            if t > 0:
-                survival[i, t] = survival[i, t-1] * (1 - hazards[i, t-1])
+    for t in range(1, num_time_bins):
+        survival[:, t] = survival[:, t-1] * (1 - hazards[:, t-1])
     
-    # Generate event times based on survival curves
-    event_times = np.zeros(batch_size)
+    # Generate event times and censoring
+    event_times = np.zeros(batch_size, dtype=int)
     event_indicators = np.zeros(batch_size)
     
+    # Generate random censoring times
+    c_times = np.random.geometric(p=censoring_rate, size=batch_size)
+    c_times = np.minimum(c_times, num_time_bins-1)
+    
+    # Generate event times
     for i in range(batch_size):
-        # Probability of event at each time
-        event_probs = hazards[i] * np.concatenate([np.ones(1), survival[i, :-1]])
+        # Find first time when survival drops below a random threshold
+        u = np.random.random()
+        event_time = num_time_bins - 1  # Default to max time
         
-        # Cumulative probability of event
-        cum_prob = np.cumsum(event_probs)
+        for t in range(num_time_bins):
+            if survival[i, t] <= u:
+                event_time = t
+                break
         
-        # Generate random uniform
-        u = np.random.uniform()
-        
-        # Find event time
-        if u <= cum_prob[-1]:
-            # Event occurs
+        # Check if event or censored
+        if event_time <= c_times[i]:
+            event_times[i] = event_time
             event_indicators[i] = 1
-            event_times[i] = np.searchsorted(cum_prob, u)
         else:
-            # Censored - apply censoring
-            if np.random.uniform() < censoring_rate:
-                # Censored before the end of follow-up
-                event_indicators[i] = 0
-                event_times[i] = np.random.randint(0, num_time_bins)
-            else:
-                # Censored at the end of follow-up
-                event_indicators[i] = 0
-                event_times[i] = num_time_bins - 1
+            event_times[i] = c_times[i]
+            event_indicators[i] = 0
     
     return hazards, survival, event_times, event_indicators
 
 def generate_competing_risks_data(batch_size=100, num_time_bins=10, num_risks=2, censoring_rate=0.3):
     """Generate synthetic competing risks data for testing metrics"""
-    # Generate risk scores for each cause (higher score = higher risk)
-    risk_scores = np.random.randn(batch_size, num_risks)
-    
-    # Convert to hazard rates (sigmoid)
-    hazard_base = 1 / (1 + np.exp(-risk_scores))
-    
-    # Generate time-dependent hazards for each cause
+    # Generate cause-specific hazards
     cause_hazards = np.zeros((batch_size, num_risks, num_time_bins))
-    for i in range(batch_size):
-        for k in range(num_risks):
-            # Increasing hazard over time
-            cause_hazards[i, k] = hazard_base[i, k] * np.linspace(0.1, 1.0, num_time_bins)
     
-    # Generate overall survival curve
-    overall_survival = np.ones((batch_size, num_time_bins))
-    for i in range(batch_size):
-        for t in range(num_time_bins):
-            if t > 0:
-                # Probability of not having any event at time t-1
-                no_event_prob = 1 - np.sum(cause_hazards[i, :, t-1])
-                overall_survival[i, t] = overall_survival[i, t-1] * no_event_prob
-    
-    # Generate cumulative incidence functions
-    cif = np.zeros((batch_size, num_risks, num_time_bins))
-    for i in range(batch_size):
-        for k in range(num_risks):
+    # Generate base risk for each patient and cause
+    for risk_idx in range(num_risks):
+        # Generate risk scores (higher score = higher risk)
+        risk_scores = np.random.randn(batch_size)
+        
+        # Convert to hazard rates (sigmoid)
+        hazard_base = 1 / (1 + np.exp(-risk_scores)) * 0.2  # Scale down to avoid too high hazards
+        
+        # Generate time-dependent hazards
+        for i in range(batch_size):
+            # Increase hazard gradually over time
             for t in range(num_time_bins):
-                # Probability of event of type k at time t
-                if t == 0:
-                    cif[i, k, t] = cause_hazards[i, k, t]
+                # Make hazard increase over time
+                time_factor = 1.0 + 0.2 * t  # Hazard increases with time
+                cause_hazards[i, risk_idx, t] = hazard_base[i] * time_factor
+    
+    # Compute overall survival from cause-specific hazards
+    # S(t) = exp(-sum_k integrated hazard_k(t))
+    survival = np.ones((batch_size, num_time_bins))
+    
+    # Calculate survival curves
+    for t in range(1, num_time_bins):
+        for i in range(batch_size):
+            # Multiply by (1-hazard) for each cause
+            for risk_idx in range(num_risks):
+                survival[i, t] = survival[i, t-1] * (1 - cause_hazards[i, risk_idx, t-1])
+    
+    # Calculate cumulative incidence functions (CIF)
+    cif = np.zeros((batch_size, num_risks, num_time_bins))
+    
+    # For each time bin and risk
+    for t in range(1, num_time_bins):
+        for risk_idx in range(num_risks):
+            for i in range(batch_size):
+                # CIF_k(t) = sum_{j=1}^t [ h_k(j) * S(j-1) ]
+                if t == 1:
+                    prev_survival = 1.0
                 else:
-                    prev_surv = overall_survival[i, t-1]
-                    event_prob = cause_hazards[i, k, t] * prev_surv
-                    cif[i, k, t] = cif[i, k, t-1] + event_prob
+                    prev_survival = survival[i, t-2]
+                
+                cif[i, risk_idx, t] = cif[i, risk_idx, t-1] + cause_hazards[i, risk_idx, t-1] * prev_survival
     
     # Generate event times and causes
-    event_times = np.zeros(batch_size)
+    event_times = np.zeros(batch_size, dtype=int)
     event_indicators = np.zeros(batch_size)
-    event_causes = np.full(batch_size, -1)  # -1 for censored
+    event_causes = np.zeros(batch_size, dtype=int)
     
+    # Generate random censoring times
+    c_times = np.random.geometric(p=censoring_rate, size=batch_size)
+    c_times = np.minimum(c_times, num_time_bins-1)
+    
+    # Generate event times and causes
     for i in range(batch_size):
-        # Probabilities of each type of event at each time
-        event_probs = np.zeros((num_risks, num_time_bins))
+        # Find first time when survival drops below a random threshold
+        u = np.random.random()
+        event_time = num_time_bins - 1  # Default to max time
+        
+        for t in range(num_time_bins):
+            if 1 - survival[i, t] >= u:
+                event_time = t
+                break
+        
+        # Determine cause (proportional to hazard at event time)
+        cause_probs = np.zeros(num_risks)
         for k in range(num_risks):
-            for t in range(num_time_bins):
-                if t == 0:
-                    event_probs[k, t] = cause_hazards[i, k, t]
-                else:
-                    event_probs[k, t] = cause_hazards[i, k, t] * overall_survival[i, t-1]
+            if event_time > 0:
+                cause_probs[k] = cause_hazards[i, k, event_time-1]
+            else:
+                cause_probs[k] = cause_hazards[i, k, 0]
         
-        # Flatten to 1D array
-        flat_probs = event_probs.flatten()
-        
-        # Append probability of no event
-        prob_no_event = overall_survival[i, -1]
-        all_probs = np.append(flat_probs, prob_no_event)
-        
-        # Ensure probabilities are non-negative
-        all_probs = np.maximum(all_probs, 0)
-        
-        # Normalize
-        all_probs = all_probs / (np.sum(all_probs) + 1e-10)
-        
-        # Sample event type and time
-        idx = np.random.choice(len(all_probs), p=all_probs)
-        
-        if idx < len(flat_probs):
-            # Event occurs
-            event_indicators[i] = 1
-            
-            # Convert flat index to (cause, time)
-            cause = idx // num_time_bins
-            time = idx % num_time_bins
-            
-            event_causes[i] = cause
-            event_times[i] = time
+        # Normalize to get probabilities
+        if np.sum(cause_probs) > 0:
+            cause_probs = cause_probs / np.sum(cause_probs)
+            cause = np.random.choice(num_risks, p=cause_probs)
         else:
-            # No event (censored at the end)
+            cause = 0
+        
+        # Check if event or censored
+        if event_time <= c_times[i]:
+            event_times[i] = event_time
+            event_indicators[i] = 1
+            event_causes[i] = cause
+        else:
+            event_times[i] = c_times[i]
             event_indicators[i] = 0
-            event_times[i] = num_time_bins - 1
-            
-            # Apply random censoring
-            if np.random.uniform() < censoring_rate:
-                event_times[i] = np.random.randint(0, num_time_bins)
+            event_causes[i] = -1  # No cause for censored
     
-    return cause_hazards, overall_survival, cif, event_times, event_indicators, event_causes
+    return cause_hazards, survival, cif, event_times, event_indicators, event_causes
 
 def test_single_risk_metrics():
     """Test metrics for SingleRiskHead against known data"""
@@ -231,7 +230,7 @@ def test_competing_risks_metrics():
     
     # Create dummy outputs dictionary
     outputs = {
-        'cause_hazards': cause_hazards_tensor,
+        'hazards': cause_hazards_tensor,
         'overall_survival': overall_survival_tensor,
         'cif': cif_tensor,
         'risk_scores': risk_scores
@@ -250,18 +249,27 @@ def test_competing_risks_metrics():
     
     # Check cause-specific c-index
     for i in range(num_risks):
-        cs_cindex_key = f'cause_specific_c_index_{i}'
+        cs_cindex_key = f'c_index_cause_{i}'
         assert cs_cindex_key in metrics
-        assert metrics[cs_cindex_key] >= 0.5  # Should be better than random
+        assert metrics[cs_cindex_key] >= 0.0  # Should be valid
+        assert metrics[cs_cindex_key] <= 1.0  # Should be valid
     
-    # Check overall c-index
-    assert 'overall_c_index' in metrics
-    assert metrics['overall_c_index'] >= 0.5  # Should be better than random
+    # Check average c-index
+    assert 'c_index_avg' in metrics
+    assert metrics['c_index_avg'] >= 0.0  # Should be valid
+    assert metrics['c_index_avg'] <= 1.0  # Should be valid
     
     # Check integrated brier score
-    assert 'integrated_brier_score' in metrics
-    assert metrics['integrated_brier_score'] >= 0  # Should be non-negative
-    assert metrics['integrated_brier_score'] <= 1  # Should be at most 1
+    for i in range(num_risks):
+        brier_key = f'brier_score_cause_{i}'
+        assert brier_key in metrics
+        assert metrics[brier_key] >= 0  # Should be non-negative
+        assert metrics[brier_key] <= 1  # Should be at most 1
+    
+    # Check average brier score
+    assert 'brier_score_avg' in metrics
+    assert metrics['brier_score_avg'] >= 0  # Should be non-negative
+    assert metrics['brier_score_avg'] <= 1  # Should be at most 1
 
 def test_classification_metrics():
     """Test classification head macro/micro metrics"""

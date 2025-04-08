@@ -69,9 +69,9 @@ class LinearAttention(nn.Module):
 - **Why**: RMST provides a clinically interpretable summary of survival curves not currently available
 - **How**: Add to the metrics module with standard error estimation
 
-**Recommendation**: Add support for competing risks performance metrics
-- **Why**: Current metrics focus on overall survival rather than cause-specific metrics
-- **How**: Implement cause-specific concordance index and Brier score for competing risks
+**Recommendation**: Enhance competing risks performance metrics
+- **Why**: While cause-specific metrics have been implemented, additional metrics would be valuable
+- **How**: Add more specialized metrics like cumulative incidence-based AUC
 
 ### 5. Deployment and Production
 

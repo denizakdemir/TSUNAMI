@@ -45,7 +45,7 @@ Here's a basic example of using TSUNAMI for survival analysis:
 import torch
 from enhanced_deephit.data.processing import DataProcessor
 from enhanced_deephit.models import EnhancedDeepHit
-from enhanced_deephit.models.tasks.survival import SingleRiskHead
+from enhanced_deephit.models.tasks.survival import SingleRiskHead, CompetingRisksHead
 from enhanced_deephit.simulation.data_generation import generate_survival_data
 
 # Generate synthetic data for demonstration

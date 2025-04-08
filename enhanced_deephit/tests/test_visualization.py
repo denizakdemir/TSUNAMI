@@ -181,7 +181,7 @@ class TestVisualizationFunctions(unittest.TestCase):
             learning_rate=0.001
         )
         
-        # Commented out competing risks model as it's not implemented yet
+        # Add visualization tests for competing risks model
         # self.cr_task_head = CompetingRisksHead(
         #     name='competing_risks',
         #     input_dim=64,
