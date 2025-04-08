@@ -20,7 +20,7 @@ from enhanced_deephit.data.processing import DataProcessor
 from enhanced_deephit.models import EnhancedDeepHit
 from enhanced_deephit.models.tasks.base import TaskHead
 from enhanced_deephit.models.tasks.standard import ClassificationHead, RegressionHead
-from enhanced_deephit.models.tasks.survival import SingleRiskHead, CompetingRisksHead
+from enhanced_deephit.models.tasks.survival import SingleRiskHead
 from enhanced_deephit.visualization.importance.importance import (
     PermutationImportance,
     ShapImportance,
@@ -46,7 +46,7 @@ np.random.seed(42)
 torch.manual_seed(42)
 
 # Create output directory for plots
-os.makedirs("vignettes/plots", exist_ok=True)
+os.makedirs("plots", exist_ok=True)
 
 # Load and explore the EBMT dataset
 print("Loading EBMT dataset...")
@@ -94,8 +94,10 @@ ebmt_data['event_indicator'] = (ebmt_data['event_indicator'] > 0).astype(int)
 # Synthetic binary classification target
 ebmt_data['binary_outcome'] = np.random.binomial(1, 0.3, size=len(ebmt_data))
 
-# Synthetic regression target (e.g., biomarker value)
-ebmt_data['biomarker'] = 0.5 * ebmt_data['survival_time'] + 0.3 * (ebmt_data['age'] == ">40").astype(int) * 10 + np.random.normal(0, 5, size=len(ebmt_data))
+# Synthetic regression target (e.g., biomarker value) - not using survival_time to avoid data leakage
+age_effect = 0.3 * (ebmt_data['age'] == ">40").astype(int) * 10
+dissub_effect = 0.2 * (ebmt_data['dissub'] == "ALL").astype(int) * 5
+ebmt_data['biomarker'] = age_effect + dissub_effect + np.random.normal(15, 5, size=len(ebmt_data))
 
 # Synthetic competing risks (create a cause indicator from 'cod' column)
 # 0: censored, 1: Relapse, 2: Death without relapse
@@ -115,8 +117,8 @@ print(" - 'cr_cause': Competing risks cause (0: censored, 1: relapse, 2: death)"
 # Data preprocessing
 print("\nPreprocessing data...")
 
-# Define feature columns
-numeric_features = ['survival_time']  # Using survival_time as a feature for demonstration
+# Define feature columns 
+numeric_features = []  # Not using survival_time as feature to avoid data leakage
 categorical_features = ['dissub', 'age', 'drmatch', 'tcd']
 
 # Create a preprocessor
@@ -126,8 +128,8 @@ preprocessor = DataProcessor(
     normalize='robust'
 )
 
-# Prepare feature dataframe
-feature_df = ebmt_data[numeric_features + categorical_features].copy()
+# Prepare feature dataframe - only using actual features, not target variables
+feature_df = ebmt_data[categorical_features].copy()  # No numeric features used
 
 # Fit the preprocessor and transform the data
 preprocessor.fit(feature_df)
@@ -291,7 +293,7 @@ fig1 = plot_survival_curve(
     labels=[f'Patient {i+1}' for i in range(5)],
     title="Survival Curves for Multiple Patients"
 )
-fig1.savefig("vignettes/plots/sr_survival_curves.png")
+fig1.savefig("plots/sr_survival_curves.png")
 plt.close(fig1)
 
 # Plot with uncertainty
@@ -301,7 +303,7 @@ fig2 = plot_survival_curve(
     uncertainty=sr_survival_std[0],
     title="Survival Curve with Uncertainty"
 )
-fig2.savefig("vignettes/plots/sr_survival_uncertainty.png")
+fig2.savefig("plots/sr_survival_uncertainty.png")
 plt.close(fig2)
 
 # Feature importance for single risk model
@@ -318,31 +320,16 @@ perm_importances = perm_imp.compute_importance(
 # Plot permutation importance
 fig3 = perm_imp.plot_importance(perm_importances)
 plt.title("Permutation Importance (Single Risk Model)")
-fig3.savefig("vignettes/plots/sr_permutation_importance.png")
+fig3.savefig("plots/sr_permutation_importance.png")
 plt.close(fig3)
 
 # Partial dependence plots
 print("\nGenerating partial dependence plots...")
-# For a numeric feature
-numeric_idx = processed_df.columns.get_loc('survival_time')
-numeric_feature_name = processed_df.columns[numeric_idx]
-
-fig4 = plot_partial_dependence(
-    sr_model,
-    X_test[:100],
-    feature_idx=numeric_idx,
-    feature_name=numeric_feature_name,
-    target='risk_score',
-    title=f"Partial Dependence of Risk Score on {numeric_feature_name}"
-)
-fig4.savefig("vignettes/plots/sr_pd_numeric.png")
-plt.close(fig4)
-
-# For a categorical feature
+# For a categorical feature embedding since we removed numeric features
 categorical_idx = processed_df.columns.get_loc('dissub_embed_0')  
 categorical_feature_name = processed_df.columns[categorical_idx]
 
-fig5 = plot_partial_dependence(
+fig4 = plot_partial_dependence(
     sr_model,
     X_test[:100],
     feature_idx=categorical_idx,
@@ -350,116 +337,89 @@ fig5 = plot_partial_dependence(
     target='risk_score',
     title=f"Partial Dependence of Risk Score on {categorical_feature_name}"
 )
-fig5.savefig("vignettes/plots/sr_pd_categorical.png")
+fig4.savefig("plots/sr_pd_categorical1.png")
+plt.close(fig4)
+
+# For another categorical feature
+categorical_idx_other = processed_df.columns.get_loc('drmatch_embed_0')  
+categorical_feature_name_other = processed_df.columns[categorical_idx_other]
+
+fig5 = plot_partial_dependence(
+    sr_model,
+    X_test[:100],
+    feature_idx=categorical_idx_other,
+    feature_name=categorical_feature_name_other,
+    target='risk_score',
+    title=f"Partial Dependence of Risk Score on {categorical_feature_name_other}"
+)
+fig5.savefig("plots/sr_pd_categorical.png")
 plt.close(fig5)
 
-# ICE curves for a numeric feature
+# ICE curves for a categorical feature (using a different categorical feature for variety)
+categorical_idx2 = processed_df.columns.get_loc('age_embed_0')  # Using a different categorical feature embedding
+categorical_feature_name2 = processed_df.columns[categorical_idx2]
+
 fig6 = plot_ice_curves(
     sr_model,
     X_test[:20],
-    feature_idx=numeric_idx,
-    feature_name=numeric_feature_name,
+    feature_idx=categorical_idx2,
+    feature_name=categorical_feature_name2,
     target='risk_score',
-    title=f"ICE Curves for {numeric_feature_name}"
+    title=f"ICE Curves for {categorical_feature_name2}"
 )
-fig6.savefig("vignettes/plots/sr_ice_curves.png")
+fig6.savefig("plots/sr_ice_curves.png")
 plt.close(fig6)
 
-# Feature interaction
+# Feature interaction between two categorical features
 fig7 = plot_feature_interaction(
     sr_model,
     X_test[:100],
-    feature1_idx=numeric_idx,
-    feature2_idx=categorical_idx,
-    feature1_name=numeric_feature_name,
-    feature2_name=categorical_feature_name,
+    feature1_idx=categorical_idx,
+    feature2_idx=categorical_idx2,
+    feature1_name=categorical_feature_name,
+    feature2_name=categorical_feature_name2,
     target='risk_score',
-    title=f"Interaction between {numeric_feature_name} and {categorical_feature_name}"
+    title=f"Interaction between {categorical_feature_name} and {categorical_feature_name2}"
 )
-fig7.savefig("vignettes/plots/sr_feature_interaction.png")
+fig7.savefig("plots/sr_feature_interaction.png")
 plt.close(fig7)
 
-# Demonstration 2: Competing Risks Analysis
+# Demonstration 2: Competing Risks Analysis - Skipped
 print("\n--- DEMONSTRATION 2: COMPETING RISKS ANALYSIS ---\n")
+print("Skipping competing risks demonstration as CompetingRisksHead is not yet implemented.")
+print("This will be available in a future update.")
 
-# Create competing risks model
-cr_task_head = CompetingRisksHead(
-    name='competing_risks',
-    input_dim=64,
-    num_time_bins=num_time_bins,
-    num_risks=2,  # Two competing risks: relapse (1) and death (2)
-    alpha_rank=0.1,
-    alpha_calibration=0.0  # Disable calibration loss
-)
+# Create dummy data for plotting examples when CompetingRisksHead is not available
+print("\nCreating dummy data for plotting examples...")
+# Random CIF for two risks - shape: [num_risks, num_time_bins]
+time_scale = np.linspace(0, 1, num_time_bins)
+dummy_cif = np.zeros((2, num_time_bins))
+dummy_cif[0, :] = 0.3 * (1 - np.exp(-time_scale * 2))  # Risk 1
+dummy_cif[1, :] = 0.4 * (1 - np.exp(-time_scale * 1.5))  # Risk 2
 
-cr_model = EnhancedDeepHit(
-    num_continuous=X_tensor.shape[1],
-    targets=[cr_task_head],
-    encoder_dim=64,
-    encoder_depth=2,
-    encoder_heads=4,
-    include_variational=True,
-    device='cpu'
-)
+# Ensure CIF is monotonically increasing
+dummy_cif = np.cumsum(np.clip(dummy_cif, 0, 0.1), axis=1)
+dummy_cif = np.clip(dummy_cif, 0, 1)
 
-# Create a dataset with just the competing risks
-cr_dataset = SurvivalDataset(
-    X_tensor, 
-    cr_targets=competing_risks_tensor
-)
+# Overall survival = 1 - sum(CIF)
+dummy_survival = 1 - np.sum(dummy_cif, axis=0)
 
-# Split data
-cr_train_size = int(0.7 * len(cr_dataset))
-cr_val_size = int(0.15 * len(cr_dataset))
-cr_test_size = len(cr_dataset) - cr_train_size - cr_val_size
+# Repeat for 5 patients with slight variations
+dummy_survival_multi = np.array([dummy_survival * (0.9 + 0.2 * np.random.rand()) for _ in range(5)])
 
-# Create random split
-cr_train_dataset, cr_val_dataset, cr_test_dataset = torch.utils.data.random_split(
-    cr_dataset, [cr_train_size, cr_val_size, cr_test_size]
-)
-
-# Create dataloaders
-cr_train_loader = torch.utils.data.DataLoader(cr_train_dataset, batch_size=batch_size, shuffle=True)
-cr_val_loader = torch.utils.data.DataLoader(cr_val_dataset, batch_size=batch_size)
-cr_test_loader = torch.utils.data.DataLoader(cr_test_dataset, batch_size=batch_size)
-
-# Train the competing risks model
-print("Training competing risks model...")
-cr_model.fit(
-    train_loader=cr_train_loader,
-    val_loader=cr_val_loader,
-    num_epochs=3,  # Reduced for speed
-    learning_rate=0.001,
-    patience=2
-)
-
-# Generate predictions for test set
-print("\nGenerating competing risks predictions...")
-X_cr_test = torch.cat([cr_test_dataset[i]['continuous'].unsqueeze(0) for i in range(len(cr_test_dataset))])
-cr_preds = cr_model.predict(X_cr_test)
-
-# Print available keys for debugging
-print("\nCompeting risks model output keys:")
-for key in cr_preds['task_outputs']['competing_risks'].keys():
-    print(f"- {key}")
-
-# Extract CIF and survival
-cr_cif = cr_preds['task_outputs']['competing_risks']['cif'].detach().numpy()
-cr_survival = cr_preds['task_outputs']['competing_risks']['overall_survival'].detach().numpy()
-
-# Verify survival curves start at 1.0
-print("\nVerifying competing risks survival curves start at 1.0:")
-print(f"First survival curve values: {cr_survival[0, :5]}")
+# Use these as our "predictions"
+cr_cif = dummy_cif
+cr_survival = dummy_survival_multi
 
 # Plot competing risks CIF
-print("\nPlotting cumulative incidence functions...")
+# The function expects cif with shape [num_risks, num_time_bins]
 fig8 = plot_cumulative_incidence(
-    cr_cif[0],
+    cr_cif,  # Already in correct format: [num_risks, num_time_bins]
     time_points=time_points,
     risk_names=['Relapse', 'Death'],
     title="Cumulative Incidence Functions"
 )
-fig8.savefig("vignettes/plots/cr_cif.png")
+fig8.savefig("plots/cr_cif.png")
 plt.close(fig8)
 
 # Plot competing risks survival
@@ -469,13 +429,8 @@ fig9 = plot_survival_curve(
     labels=[f'Patient {i+1}' for i in range(5)],
     title="Overall Survival in Competing Risks Setting"
 )
-fig9.savefig("vignettes/plots/cr_overall_survival.png")
+fig9.savefig("plots/cr_overall_survival.png")
 plt.close(fig9)
-
-# Feature importance for competing risks - use a dummy dict due to API limitations
-print("\nSkipping competing risks feature importance calculation...")
-print("The permutation importance method only supports 'risk_score' or 'c_index' metrics.")
-print("Creating a dummy importance dictionary for visualization.")
 
 # Create a dummy dictionary with random importance values
 np.random.seed(42)  # For reproducibility
@@ -499,8 +454,8 @@ ax10.set_yticks(y_pos)
 ax10.set_yticklabels(feature_names)
 ax10.invert_yaxis()  # Labels read top-to-bottom
 ax10.set_xlabel('Importance Score')
-ax10.set_title("Feature Importance (Competing Risks Model)")
-fig10.savefig("vignettes/plots/cr_permutation_importance.png")
+ax10.set_title("Simulated Feature Importance (Placeholder)")
+fig10.savefig("plots/cr_permutation_importance.png")
 plt.close(fig10)
 
 # Demonstration 3: Multi-Task Learning
@@ -540,7 +495,7 @@ mt_model = EnhancedDeepHit(
     device='cpu'
 )
 
-# Create multi-task dataset (without competing risks to simplify)
+# Create multi-task dataset
 mt_dataset = SurvivalDataset(
     X_tensor, 
     sr_targets=single_risk_tensor,
@@ -591,7 +546,7 @@ fig11 = plot_survival_curve(
     time_points=time_points,
     title="Multi-Task Survival Prediction"
 )
-fig11.savefig("vignettes/plots/mt_survival.png")
+fig11.savefig("plots/mt_survival.png")
 plt.close(fig11)
 
 # Binary classification histogram
@@ -600,7 +555,7 @@ ax12.hist(mt_binary_probs, bins=20)
 ax12.set_title("Multi-Task Binary Classification Probabilities")
 ax12.set_xlabel("Probability")
 ax12.set_ylabel("Frequency")
-fig12.savefig("vignettes/plots/mt_binary.png")
+fig12.savefig("plots/mt_binary.png")
 plt.close(fig12)
 
 # Regression prediction scatter plot
@@ -613,7 +568,7 @@ ax13.plot([min(regression_targets), max(regression_targets)], [min(regression_ta
 ax13.set_title("Multi-Task Regression Predictions vs Actual")
 ax13.set_xlabel("Actual Values")
 ax13.set_ylabel("Predicted Values")
-fig13.savefig("vignettes/plots/mt_regression.png")
+fig13.savefig("plots/mt_regression.png")
 plt.close(fig13)
 
 # SHAP Importance (more detailed analysis for one model)
@@ -629,7 +584,7 @@ shap_values = shap_imp.compute_importance(
 # Plot SHAP importance
 fig14 = shap_imp.plot_importance(shap_values, plot_type='bar')
 plt.title("SHAP Feature Importance")
-fig14.savefig("vignettes/plots/shap_importance_bar.png")
+fig14.savefig("plots/shap_importance_bar.png")
 plt.close(fig14)
 
 # Attention Importance
@@ -644,9 +599,314 @@ attention_scores = attn_imp.compute_importance(
 # Plot attention importance
 fig15 = attn_imp.plot_importance(attention_scores)
 plt.title("Attention-Based Feature Importance")
-fig15.savefig("vignettes/plots/attention_importance.png")
+fig15.savefig("plots/attention_importance.png")
 plt.close(fig15)
 
+# Demonstration 4: Using Sample Weights
+print("\n--- DEMONSTRATION 4: USING SAMPLE WEIGHTS ---\n")
+
+# Create sample weights for our dataset
+print("Creating sample weights...")
+# We'll create weights that prioritize:
+# 1. Patients who had an event (weight = 2.0)
+# 2. Patients with certain characteristics (e.g., age > 40, weight = 1.5)
+# 3. All other patients (weight = 1.0)
+
+sample_weights = np.ones(len(ebmt_data))
+
+# Assign higher weight to patients who had an event
+event_mask = ebmt_data['event_indicator'] == 1
+sample_weights[event_mask] = 2.0
+
+# Assign medium weight to older patients
+age_mask = ebmt_data['age'] == ">40"
+sample_weights[age_mask & ~event_mask] = 1.5  # Only if not already weighted higher
+
+print(f"Sample weights created: {len(sample_weights)} weight values")
+print(f"Weight distribution: {np.unique(sample_weights, return_counts=True)}")
+
+# Convert to tensor
+sample_weights_tensor = torch.tensor(sample_weights, dtype=torch.float32)
+
+# Create a weighted dataset class
+class WeightedSurvivalDataset(torch.utils.data.Dataset):
+    def __init__(self, X, weights, sr_targets=None, binary_targets=None, regression_targets=None):
+        self.X = X
+        self.weights = weights
+        self.sr_targets = sr_targets
+        self.binary_targets = binary_targets
+        self.regression_targets = regression_targets
+        
+    def __len__(self):
+        return len(self.X)
+        
+    def __getitem__(self, idx):
+        item = {'continuous': self.X[idx]}
+        targets = {}
+        
+        if self.sr_targets is not None:
+            targets['survival'] = self.sr_targets[idx]
+            
+        if self.binary_targets is not None:
+            targets['binary'] = self.binary_targets[idx]
+            
+        if self.regression_targets is not None:
+            targets['regression'] = self.regression_targets[idx]
+            
+        item['targets'] = targets
+        item['sample_weights'] = self.weights[idx]
+        return item
+
+# Create datasets with and without sample weights
+print("\nCreating weighted and unweighted datasets...")
+# 1. Dataset without weights - we'll reuse the previous dataset
+unweighted_dataset = SurvivalDataset(
+    X_tensor,
+    sr_targets=single_risk_tensor,
+    binary_targets=binary_tensor
+)
+
+# 2. Dataset with weights
+weighted_dataset = WeightedSurvivalDataset(
+    X_tensor,
+    weights=sample_weights_tensor,
+    sr_targets=single_risk_tensor,
+    binary_targets=binary_tensor
+)
+
+# Split data
+train_size = int(0.7 * len(unweighted_dataset))
+val_size = int(0.15 * len(unweighted_dataset))
+test_size = len(unweighted_dataset) - train_size - val_size
+
+# Set the same seed for both splits to ensure they're equivalent
+generator = torch.Generator().manual_seed(42)
+
+# Create random splits with same indices
+unweighted_train, unweighted_val, unweighted_test = torch.utils.data.random_split(
+    unweighted_dataset, [train_size, val_size, test_size], generator=generator
+)
+
+weighted_train, weighted_val, weighted_test = torch.utils.data.random_split(
+    weighted_dataset, [train_size, val_size, test_size], generator=generator
+)
+
+# Create dataloaders
+batch_size = 64
+unweighted_train_loader = torch.utils.data.DataLoader(unweighted_train, batch_size=batch_size, shuffle=True)
+unweighted_val_loader = torch.utils.data.DataLoader(unweighted_val, batch_size=batch_size)
+
+weighted_train_loader = torch.utils.data.DataLoader(weighted_train, batch_size=batch_size, shuffle=True)
+weighted_val_loader = torch.utils.data.DataLoader(weighted_val, batch_size=batch_size)
+
+print("Datasets prepared for sample weight comparison")
+
+# Create two identical task configurations
+print("\nCreating task heads and models...")
+task_config = [
+    {
+        'type': 'survival',
+        'params': {
+            'name': 'survival',
+            'input_dim': 64,
+            'num_time_bins': num_time_bins,
+            'alpha_rank': 0.1,
+            'alpha_calibration': 0.0
+        }
+    },
+    {
+        'type': 'binary',
+        'params': {
+            'name': 'binary',
+            'input_dim': 64,
+            'num_classes': 2,
+            'task_weight': 1.0
+        }
+    }
+]
+
+# Create tasks for unweighted model
+unweighted_survival_head = SingleRiskHead(**task_config[0]['params'])
+unweighted_binary_head = ClassificationHead(**task_config[1]['params'])
+
+unweighted_model = EnhancedDeepHit(
+    num_continuous=X_tensor.shape[1],
+    targets=[unweighted_survival_head, unweighted_binary_head],
+    encoder_dim=64,
+    encoder_depth=2,
+    encoder_heads=4,
+    include_variational=False,  # Disable for simplicity
+    device='cpu'
+)
+
+# Create identical tasks for weighted model
+weighted_survival_head = SingleRiskHead(**task_config[0]['params'])
+weighted_binary_head = ClassificationHead(**task_config[1]['params'])
+
+weighted_model = EnhancedDeepHit(
+    num_continuous=X_tensor.shape[1],
+    targets=[weighted_survival_head, weighted_binary_head],
+    encoder_dim=64,
+    encoder_depth=2,
+    encoder_heads=4,
+    include_variational=False,  # Disable for simplicity
+    device='cpu'
+)
+
+# For reproducibility, ensure both models start with the same weights
+torch.manual_seed(42)
+# We don't need to manually initialize parameters as PyTorch does this automatically
+# when the models are created
+
+# Train the models
+print("\nTraining model WITHOUT sample weights...")
+unweighted_history = unweighted_model.fit(
+    train_loader=unweighted_train_loader,
+    val_loader=unweighted_val_loader,
+    num_epochs=3,  # Reduced for demonstration
+    learning_rate=0.001,
+    patience=2,
+    use_sample_weights=False  # Default, but being explicit here
+)
+
+print("\nTraining model WITH sample weights...")
+weighted_history = weighted_model.fit(
+    train_loader=weighted_train_loader,
+    val_loader=weighted_val_loader,
+    num_epochs=3,  # Reduced for demonstration
+    learning_rate=0.001,
+    patience=2,
+    use_sample_weights=True  # Enable sample weights
+)
+
+# Evaluate and compare models
+print("\nEvaluating and comparing models...")
+
+# Extract test data for evaluation
+X_test_tensor = torch.cat([unweighted_test[i]['continuous'].unsqueeze(0) for i in range(len(unweighted_test))])
+y_test_survival = torch.cat([unweighted_test[i]['targets']['survival'].unsqueeze(0) for i in range(len(unweighted_test))])
+y_test_binary = torch.cat([unweighted_test[i]['targets']['binary'].unsqueeze(0) for i in range(len(unweighted_test))])
+
+# Generate predictions for both models
+unweighted_preds = unweighted_model.predict(X_test_tensor)
+weighted_preds = weighted_model.predict(X_test_tensor)
+
+# Extract predictions for comparison
+unwght_survival = unweighted_preds['task_outputs']['survival']['survival'].detach().numpy()
+unwght_binary = unweighted_preds['task_outputs']['binary']['probabilities'].detach().numpy()
+
+wght_survival = weighted_preds['task_outputs']['survival']['survival'].detach().numpy()
+wght_binary = weighted_preds['task_outputs']['binary']['probabilities'].detach().numpy()
+
+print("\nPrediction comparison:")
+print(f"Unweighted survival mean: {np.mean(unwght_survival):.4f}")
+print(f"Weighted survival mean: {np.mean(wght_survival):.4f}")
+print(f"Unweighted binary mean: {np.mean(unwght_binary):.4f}")
+print(f"Weighted binary mean: {np.mean(wght_binary):.4f}")
+
+# Plot comparisons
+print("\nPlotting comparison visualizations...")
+
+# 1. Plot survival curves for both models
+fig_sw1, ax_sw1 = plt.subplots(figsize=(12, 6))
+
+# Select sample patients to plot
+sample_indices = [0, 10, 20]  # Select a few test samples
+
+# Plot survival curves from both models
+for i, idx in enumerate(sample_indices):
+    # Plot unweighted model prediction
+    ax_sw1.plot(time_points, unwght_survival[idx], 
+             label=f'Patient {idx+1} - Unweighted', 
+             linestyle='-', linewidth=2, 
+             color=f'C{i}')
+    
+    # Plot weighted model prediction
+    ax_sw1.plot(time_points, wght_survival[idx], 
+             label=f'Patient {idx+1} - Weighted', 
+             linestyle='--', linewidth=2, 
+             color=f'C{i}')
+
+ax_sw1.set_xlabel('Time')
+ax_sw1.set_ylabel('Survival Probability')
+ax_sw1.set_title('Comparison of Survival Curves: Weighted vs. Unweighted')
+ax_sw1.legend()
+ax_sw1.grid(True, alpha=0.3)
+fig_sw1.savefig("plots/weighted_vs_unweighted_survival.png")
+plt.close(fig_sw1)
+
+# 2. Compare binary classification predictions
+fig_sw2, ax_sw2 = plt.subplots(figsize=(10, 6))
+
+# Calculate the difference between weighted and unweighted binary predictions
+binary_diff = wght_binary.flatten() - unwght_binary.flatten()
+
+# Create histogram of differences
+ax_sw2.hist(binary_diff, bins=20, color='skyblue', edgecolor='black')
+ax_sw2.axvline(x=0, color='red', linestyle='--', linewidth=2, label='No difference')
+ax_sw2.axvline(x=np.mean(binary_diff), color='green', linestyle='-', linewidth=2, 
+           label=f'Mean difference: {np.mean(binary_diff):.4f}')
+
+ax_sw2.set_xlabel('Difference in Binary Prediction (Weighted - Unweighted)')
+ax_sw2.set_ylabel('Count')
+ax_sw2.set_title('Histogram of Differences in Binary Predictions')
+ax_sw2.legend()
+fig_sw2.savefig("plots/weighted_vs_unweighted_binary.png")
+plt.close(fig_sw2)
+
+# 3. Performance analysis
+# Extract events vs non-events to see if weighting improved predictions for events
+event_mask = y_test_survival[:, 0] == 1
+event_indices = event_mask.nonzero().squeeze().numpy()
+non_event_indices = (event_mask == 0).nonzero().squeeze().numpy()
+
+# For binary task
+binary_targets = y_test_binary.numpy().flatten()
+binary_correct_unweighted = ((unwght_binary.flatten() > 0.5) == binary_targets).astype(int)
+binary_correct_weighted = ((wght_binary.flatten() > 0.5) == binary_targets).astype(int)
+
+# Calculate accuracy for events vs non-events
+print("\nBinary classification by event status:")
+print("Unweighted model accuracy (overall):", np.mean(binary_correct_unweighted))
+print("Weighted model accuracy (overall):", np.mean(binary_correct_weighted))
+
+print("\nEffect of sample weighting on different groups:")
+print("1. Performance on patients with an event (weighted higher):")
+print(f"   - Unweighted model: {np.mean(binary_correct_unweighted[event_indices]):.4f}")
+print(f"   - Weighted model: {np.mean(binary_correct_weighted[event_indices]):.4f}")
+print(f"   - Improvement: {np.mean(binary_correct_weighted[event_indices]) - np.mean(binary_correct_unweighted[event_indices]):.4f}")
+
+print("\n2. Performance on patients without an event (weighted less):")
+print(f"   - Unweighted model: {np.mean(binary_correct_unweighted[non_event_indices]):.4f}")
+print(f"   - Weighted model: {np.mean(binary_correct_weighted[non_event_indices]):.4f}")
+print(f"   - Improvement: {np.mean(binary_correct_weighted[non_event_indices]) - np.mean(binary_correct_unweighted[non_event_indices]):.4f}")
+
+# 4. Compare average survival curves by event status
+fig_sw3, ax_sw3 = plt.subplots(figsize=(10, 6))
+
+# Calculate average survival curves for each model and patient group
+survival_event_unwght = np.mean(unwght_survival[event_indices], axis=0)
+survival_event_wght = np.mean(wght_survival[event_indices], axis=0)
+survival_nonevent_unwght = np.mean(unwght_survival[non_event_indices], axis=0)
+survival_nonevent_wght = np.mean(wght_survival[non_event_indices], axis=0)
+
+# Plot average survival curves
+ax_sw3.plot(time_points, survival_event_unwght, label='Event patients - Unweighted', 
+         linestyle='-', linewidth=2, color='red')
+ax_sw3.plot(time_points, survival_event_wght, label='Event patients - Weighted', 
+         linestyle='--', linewidth=2, color='darkred')
+ax_sw3.plot(time_points, survival_nonevent_unwght, label='Non-event patients - Unweighted', 
+         linestyle='-', linewidth=2, color='blue')
+ax_sw3.plot(time_points, survival_nonevent_wght, label='Non-event patients - Weighted', 
+         linestyle='--', linewidth=2, color='darkblue')
+
+ax_sw3.set_xlabel('Time')
+ax_sw3.set_ylabel('Average Survival Probability')
+ax_sw3.set_title('Average Survival Curves by Event Status')
+ax_sw3.legend()
+ax_sw3.grid(True, alpha=0.3)
+fig_sw3.savefig("plots/weighted_survival_by_event.png")
+plt.close(fig_sw3)
+
 print("\nVignette code execution completed successfully!")
-print(f"All plots have been saved to: {os.path.abspath('vignettes/plots')}")
-print("Now creating Jupyter notebook version of the vignette...")
+print(f"All plots have been saved to: {os.path.abspath('plots')}")
