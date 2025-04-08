@@ -201,3 +201,5 @@ temp/
 tmp/
 .temp/
 .tmp/
+
+**/CLAUDE.local.md

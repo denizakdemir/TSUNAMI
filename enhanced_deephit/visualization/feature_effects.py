@@ -31,7 +31,9 @@ def plot_partial_dependence(
     ylabel: Optional[str] = None,
     feature_range: Optional[Tuple[float, float]] = None,
     show_distribution: bool = True,
-    ax: Optional[plt.Axes] = None
+    ax: Optional[plt.Axes] = None,
+    categorical_info: Optional[Dict] = None,
+    sample_weights: Optional[torch.Tensor] = None
 ) -> Figure:
     """
     Plot partial dependence of prediction on a specified feature.
@@ -83,6 +85,13 @@ def plot_partial_dependence(
     ax : plt.Axes, optional
         Axes to plot on (creates new figure if not provided)
         
+    categorical_info : Dict, optional
+        Information about the feature if it's categorical, including
+        original values mapping
+        
+    sample_weights : torch.Tensor, optional
+        Sample weights for weighted feature effect calculations [n_samples]
+        
     Returns
     -------
     matplotlib.figure.Figure
@@ -107,9 +116,15 @@ def plot_partial_dependence(
     if feature_name is None:
         feature_name = f"Feature {feature_idx}"
     
+    # Check if we're dealing with a categorical feature
+    is_categorical = categorical_info is not None
+    
     # Set axis labels if not provided
     if xlabel is None:
-        xlabel = feature_name
+        if is_categorical and 'original_name' in categorical_info:
+            xlabel = categorical_info['original_name']
+        else:
+            xlabel = feature_name
     
     if ylabel is None:
         if target == 'risk_score':
@@ -123,21 +138,248 @@ def plot_partial_dependence(
     
     # Set title if not provided
     if title is None:
-        title = f"Partial Dependence of {target.replace('_', ' ').title()} on {feature_name}"
+        display_name = categorical_info.get('original_name', feature_name) if is_categorical else feature_name
+        title = f"Partial Dependence of {target.replace('_', ' ').title()} on {display_name}"
     
     # Extract feature values
     feature_values = X[:, feature_idx].numpy()
     
-    # Determine feature range
-    if feature_range is None:
-        min_val = np.min(feature_values)
-        max_val = np.max(feature_values)
-        # Add some padding
-        range_width = max_val - min_val
-        min_val -= range_width * 0.1
-        max_val += range_width * 0.1
-        feature_range = (min_val, max_val)
+    # For categorical features, use actual category values rather than numerical embedding values
+    if is_categorical:
+        # Determine unique feature indices based on the mapping
+        reverse_mapping = categorical_info.get('reverse_mapping', {})
+        
+        if reverse_mapping:
+            # Use the categories directly rather than numerical grid points
+            category_indices = sorted(reverse_mapping.keys())
+            
+            # Compute partial dependence for each category
+            pd_values = []
+            category_labels = []
+            
+            for idx in category_indices:
+                # Convert index to actual category value for label
+                category_labels.append(str(reverse_mapping[idx]))
+                
+                # Create a copy of the data - all embedding dimensions must be set appropriately
+                # For simplicity, we'll use one-hot style embedding initialization
+                X_modified = X.clone()
+                
+                # If this is part of a multi-dimensional embedding, we need to find all dimensions
+                embed_dim = categorical_info.get('embed_dim', 1)
+                embed_base = feature_idx - (feature_idx % embed_dim)
+                
+                # Reset all embedding dimensions to 0
+                for i in range(embed_dim):
+                    if embed_base + i < X.shape[1]:
+                        X_modified[:, embed_base + i] = 0.0
+                
+                # Set the first dimension to a normalized value based on the category index
+                # This mimics how categorical values are initially encoded
+                X_modified[:, embed_base] = idx / categorical_info.get('cardinality', 1)
+                
+                # Get predictions
+                with torch.no_grad():
+                    if sample_weights is not None:
+                        predictions = model.predict(X_modified, sample_weights=sample_weights)
+                    else:
+                        predictions = model.predict(X_modified)
+                
+                # Extract relevant prediction
+                if task_name is None:
+                    task_name = list(predictions['task_outputs'].keys())[0]
+                
+                if target == 'risk_score':
+                    pred_value = predictions['task_outputs'][task_name]['risk_score'].mean().item()
+                elif target == 'survival':
+                    if time_bin is None:
+                        time_bin = 0  # Default to first time bin
+                    pred_value = predictions['task_outputs'][task_name]['survival'][:, time_bin].mean().item()
+                elif target == 'hazard':
+                    if time_bin is None:
+                        time_bin = 0  # Default to first time bin
+                    pred_value = predictions['task_outputs'][task_name]['hazard'][:, time_bin].mean().item()
+                else:
+                    raise ValueError(f"Unsupported target: {target}")
+                
+                pd_values.append(pred_value)
+            
+            # Convert to numpy array
+            pd_values = np.array(pd_values)
+            
+            # Plot categorical partial dependence as bar chart
+            x_pos = np.arange(len(category_labels))
+            ax.bar(x_pos, pd_values, alpha=0.7)
+            
+            # Set x-axis labels to category names
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(category_labels, rotation=45, ha='right')
+            
+            # Add distribution as bar chart if requested
+            if show_distribution and dist_ax is not None:
+                # Count instances in each category
+                counts = {}
+                for val in feature_values:
+                    # Determine which category this value corresponds to
+                    # For simplicity, find closest category index
+                    closest_idx = min(category_indices, key=lambda x: abs(val - x/categorical_info.get('cardinality', 1)))
+                    cat = reverse_mapping.get(closest_idx, 'Unknown')
+                    counts[cat] = counts.get(cat, 0) + 1
+                
+                # Plot distribution
+                dist_values = [counts.get(reverse_mapping.get(idx, 'Unknown'), 0) for idx in category_indices]
+                total = sum(dist_values)
+                dist_values = [v/total for v in dist_values] if total > 0 else dist_values
+                
+                dist_ax.bar(x_pos, dist_values, alpha=0.5)
+                dist_ax.set_ylabel('Proportion')
+                dist_ax.set_xticks(x_pos)
+                dist_ax.set_xticklabels(category_labels, rotation=45, ha='right')
+                dist_ax.grid(True, alpha=0.3)
+        else:
+            # Fallback to continuous treatment if no mapping available
+            grid_values, pd_values = _compute_continuous_dependence(
+                model, X, feature_idx, feature_range, n_points, target, task_name, time_bin, sample_weights
+            )
+            
+            # Plot partial dependence
+            ax.plot(grid_values, pd_values, 'b-', linewidth=2)
+            
+            # Add feature distribution if requested
+            if show_distribution and dist_ax is not None:
+                dist_ax.hist(feature_values, bins=30, alpha=0.5, density=True)
+                dist_ax.set_ylabel('Density')
+                dist_ax.grid(True, alpha=0.3)
+    else:
+        # Determine feature range for continuous features
+        if feature_range is None:
+            min_val = np.min(feature_values)
+            max_val = np.max(feature_values)
+            # Add some padding
+            range_width = max_val - min_val
+            min_val -= range_width * 0.1
+            max_val += range_width * 0.1
+            feature_range = (min_val, max_val)
+        
+        # For continuous features, compute partial dependence over a grid
+        grid_values, pd_values = _compute_continuous_dependence(
+            model, X, feature_idx, feature_range, n_points, target, task_name, time_bin, sample_weights
+        )
+        
+        # Plot partial dependence
+        ax.plot(grid_values, pd_values, 'b-', linewidth=2)
+        
+        # Add feature distribution if requested
+        if show_distribution and dist_ax is not None:
+            dist_ax.hist(feature_values, bins=30, alpha=0.5, density=True)
+            dist_ax.set_ylabel('Density')
+            dist_ax.grid(True, alpha=0.3)
     
+    # Set axis labels and title
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    
+    # Add grid
+    ax.grid(True, alpha=0.3)
+    
+    # Add reference line at mean prediction
+    with torch.no_grad():
+        if sample_weights is not None:
+            predictions = model.predict(X, sample_weights=sample_weights)
+        else:
+            predictions = model.predict(X)
+    
+    # Extract task name if not provided
+    if task_name is None:
+        task_name = list(predictions['task_outputs'].keys())[0]
+    
+    if target == 'risk_score':
+        mean_pred = predictions['task_outputs'][task_name]['risk_score'].mean().item()
+    elif target == 'survival':
+        if time_bin is None:
+            time_bin = 0  # Default to first time bin
+        mean_pred = predictions['task_outputs'][task_name]['survival'][:, time_bin].mean().item()
+    elif target == 'hazard':
+        if time_bin is None:
+            time_bin = 0  # Default to first time bin
+        mean_pred = predictions['task_outputs'][task_name]['hazard'][:, time_bin].mean().item()
+    
+    # For categorical, add horizontal line; for continuous, use traditional reference line
+    if is_categorical and len(category_labels) > 0:
+        ax.axhline(
+            mean_pred,
+            color='r',
+            linestyle='--',
+            alpha=0.5,
+            label=f"Mean {target.replace('_', ' ').title()}"
+        )
+    else:
+        ax.axhline(
+            mean_pred,
+            color='r',
+            linestyle='--',
+            alpha=0.5,
+            label=f"Mean {target.replace('_', ' ').title()}"
+        )
+    
+    # Add legend
+    ax.legend(loc='best')
+    
+    plt.tight_layout()
+    return fig
+
+
+def _compute_continuous_dependence(
+    model: Any,
+    X: torch.Tensor,
+    feature_idx: int,
+    feature_range: Tuple[float, float],
+    n_points: int,
+    target: str,
+    task_name: Optional[str] = None,
+    time_bin: Optional[int] = None,
+    sample_weights: Optional[torch.Tensor] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Helper function to compute continuous partial dependence.
+    
+    Parameters
+    ----------
+    model : Any
+        The trained model to use for predictions
+        
+    X : torch.Tensor
+        Input features [n_samples, n_features]
+        
+    feature_idx : int
+        Index of the feature to analyze
+        
+    feature_range : Tuple[float, float]
+        Range of feature values to explore
+        
+    n_points : int
+        Number of points to evaluate
+        
+    target : str
+        Target prediction to analyze ('risk_score', 'survival', 'hazard')
+        
+    task_name : str, optional
+        Name of the task for multi-task models
+        
+    time_bin : int, optional
+        Time bin for survival/hazard functions
+        
+    sample_weights : torch.Tensor, optional
+        Sample weights for weighted feature effect calculations [n_samples]
+        
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        Tuple containing:
+        - Grid values (feature values)
+        - Partial dependence values (predictions)
+    """
     # Generate feature values to evaluate
     grid_values = np.linspace(feature_range[0], feature_range[1], n_points)
     
@@ -153,7 +395,10 @@ def plot_partial_dependence(
         
         # Get predictions
         with torch.no_grad():
-            predictions = model.predict(X_modified)
+            if sample_weights is not None:
+                predictions = model.predict(X_modified, sample_weights=sample_weights)
+            else:
+                predictions = model.predict(X_modified)
         
         # Extract relevant prediction
         if task_name is None:
@@ -177,51 +422,7 @@ def plot_partial_dependence(
     # Convert to numpy array
     pd_values = np.array(pd_values)
     
-    # Plot partial dependence
-    ax.plot(grid_values, pd_values, 'b-', linewidth=2)
-    
-    # Add feature distribution if requested
-    if show_distribution and dist_ax is not None:
-        dist_ax.hist(feature_values, bins=30, alpha=0.5, density=True)
-        dist_ax.set_ylabel('Density')
-        dist_ax.grid(True, alpha=0.3)
-    
-    # Set axis labels and title
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    
-    # Add grid
-    ax.grid(True, alpha=0.3)
-    
-    # Add reference line at mean prediction
-    with torch.no_grad():
-        predictions = model.predict(X)
-    
-    if target == 'risk_score':
-        mean_pred = predictions['task_outputs'][task_name]['risk_score'].mean().item()
-    elif target == 'survival':
-        if time_bin is None:
-            time_bin = 0  # Default to first time bin
-        mean_pred = predictions['task_outputs'][task_name]['survival'][:, time_bin].mean().item()
-    elif target == 'hazard':
-        if time_bin is None:
-            time_bin = 0  # Default to first time bin
-        mean_pred = predictions['task_outputs'][task_name]['hazard'][:, time_bin].mean().item()
-    
-    ax.axhline(
-        mean_pred,
-        color='r',
-        linestyle='--',
-        alpha=0.5,
-        label=f"Mean {target.replace('_', ' ').title()}"
-    )
-    
-    # Add legend
-    ax.legend(loc='best')
-    
-    plt.tight_layout()
-    return fig
+    return grid_values, pd_values
 
 
 def plot_ice_curves(

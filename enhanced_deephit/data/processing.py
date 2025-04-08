@@ -170,11 +170,14 @@ class DataProcessor(BaseEstimator, TransformerMixin):
                 else:
                     embed_dim = 4  # Default
                 
-                # Store embedding info
+                # Store embedding info with original category labels
+                unique_vals = X[col].dropna().unique()
                 self.cat_embed_info[col] = {
                     'cardinality': cardinality + 1,  # +1 for unknown/missing
                     'embed_dim': embed_dim,
-                    'mapping': {val: i for i, val in enumerate(X[col].dropna().unique())}
+                    'mapping': {val: i for i, val in enumerate(unique_vals)},
+                    'reverse_mapping': {i: val for i, val in enumerate(unique_vals)},
+                    'original_name': col  # Store original variable name
                 }
                 
         # Initialize and fit scaler
@@ -480,7 +483,9 @@ def build_category_info(processor: DataProcessor) -> List[Dict]:
         cat_info.append({
             'name': col,
             'cardinality': info['cardinality'],
-            'embed_dim': info['embed_dim']
+            'embed_dim': info['embed_dim'],
+            'original_name': info.get('original_name', col),
+            'reverse_mapping': info.get('reverse_mapping', {})
         })
         
     return cat_info

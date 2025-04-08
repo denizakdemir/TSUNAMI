@@ -45,7 +45,10 @@ class PermutationImportance:
         n_repeats: int = 5,
         feature_names: Optional[List[str]] = None,
         metric: str = 'risk_score',
-        task_name: Optional[str] = None
+        task_name: Optional[str] = None,
+        cat_feature_info: Optional[List[Dict]] = None,
+        use_original_names: bool = True,
+        sample_weights: Optional[torch.Tensor] = None
     ) -> Dict[str, float]:
         """
         Compute permutation importance scores.
@@ -69,6 +72,15 @@ class PermutationImportance:
             
         task_name : str, optional
             Name of the task to compute importance for (if multi-task model)
+            
+        cat_feature_info : List[Dict], optional
+            Information about categorical features for proper grouping
+            
+        use_original_names : bool, default=True
+            Whether to use original variable names for categorical features
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted importance calculations [n_samples]
             
         Returns
         -------
@@ -95,7 +107,10 @@ class PermutationImportance:
             
         # Get baseline predictions
         with torch.no_grad():
-            baseline_preds = self.model.predict(**continuous_input)
+            if sample_weights is not None:
+                baseline_preds = self.model.predict(**continuous_input, sample_weights=sample_weights)
+            else:
+                baseline_preds = self.model.predict(**continuous_input)
         
         # Extract relevant metric from predictions
         if metric == 'risk_score':
@@ -113,7 +128,13 @@ class PermutationImportance:
             event_indicator = y[:, 0].cpu().numpy()
             event_time = y[:, 1].cpu().numpy()
             risk_scores = baseline_preds['task_outputs'][task_name]['risk_score'].cpu().numpy()
-            baseline_metric = self._compute_c_index(risk_scores, event_time, event_indicator)
+            
+            # Pass sample weights to c-index calculation if available
+            if sample_weights is not None:
+                weights_np = sample_weights.cpu().numpy()
+                baseline_metric = self._compute_c_index(risk_scores, event_time, event_indicator, weights_np)
+            else:
+                baseline_metric = self._compute_c_index(risk_scores, event_time, event_indicator)
         else:
             raise ValueError(f"Unsupported metric: {metric}")
         
@@ -125,10 +146,101 @@ class PermutationImportance:
             feature_names = [f'feature_{i}' for i in range(n_features)]
         
         # Initialize importance scores
-        importance_scores = {name: 0.0 for name in feature_names}
+        raw_importance_scores = {name: 0.0 for name in feature_names}
         
-        # For each feature, permute its values and compute importance
+        # Generate feature index groups for categorical variables
+        cat_feature_groups = {}
+        if cat_feature_info:
+            # Group feature indices by original variable name
+            feature_name_to_idx = {name: i for i, name in enumerate(feature_names)}
+            
+            for cat_info in cat_feature_info:
+                orig_name = cat_info.get('original_name', cat_info['name'])
+                
+                # Find all feature indices that belong to this categorical variable
+                embed_indices = []
+                embed_prefix = f"{cat_info['name']}_embed_"
+                
+                for i, name in enumerate(feature_names):
+                    if name.startswith(embed_prefix):
+                        embed_indices.append(i)
+                
+                if embed_indices:
+                    cat_feature_groups[orig_name] = embed_indices
+        
+        # For each feature (or feature group for categorical), permute its values and compute importance
+        processed_indices = set()
+        
+        # First, handle categorical feature groups
+        for cat_name, indices in cat_feature_groups.items():
+            # Skip if we've already processed these indices
+            if any(idx in processed_indices for idx in indices):
+                continue
+            
+            # Mark these indices as processed
+            processed_indices.update(indices)
+            
+            feature_importance = 0.0
+            
+            # Repeat permutation multiple times for stability
+            for j in range(n_repeats):
+                # Create a copy of the input tensor
+                X_permuted = X_tensor.clone()
+                
+                # Permute all embedding dimensions together
+                perm_idx = torch.randperm(X_tensor.shape[0])
+                for idx in indices:
+                    X_permuted[:, idx] = X_permuted[perm_idx, idx]
+                
+                # Create the input format that the model expects
+                if isinstance(X, dict):
+                    permuted_input = dict(X)  # Make a copy of the original dict
+                    permuted_input['continuous'] = X_permuted
+                else:
+                    permuted_input = {'continuous': X_permuted}
+                
+                # Get predictions with permuted feature
+                with torch.no_grad():
+                    if sample_weights is not None:
+                        permuted_preds = self.model.predict(**permuted_input, sample_weights=sample_weights)
+                    else:
+                        permuted_preds = self.model.predict(**permuted_input)
+                
+                # Extract metric from permuted predictions
+                if metric == 'risk_score':
+                    permuted_metric = permuted_preds['task_outputs'][task_name]['risk_score'].cpu().numpy()
+                    # Compute mean absolute difference in risk scores
+                    if sample_weights is not None:
+                        weights_np = sample_weights.cpu().numpy()
+                        importance = np.average(np.abs(baseline_metric - permuted_metric), weights=weights_np)
+                    else:
+                        importance = np.mean(np.abs(baseline_metric - permuted_metric))
+                elif metric == 'c_index' and y is not None:
+                    # Compute c-index using survival targets
+                    risk_scores = permuted_preds['task_outputs'][task_name]['risk_score'].cpu().numpy()
+                    if sample_weights is not None:
+                        weights_np = sample_weights.cpu().numpy()
+                        permuted_metric = self._compute_c_index(risk_scores, event_time, event_indicator, weights_np)
+                    else:
+                        permuted_metric = self._compute_c_index(risk_scores, event_time, event_indicator)
+                    # Compute difference in c-index
+                    importance = baseline_metric - permuted_metric
+                
+                feature_importance += importance
+            
+            # Average importance over repeats
+            # Store under the original category name
+            raw_importance_scores[cat_name] = feature_importance / n_repeats
+            
+            # Also assign to all embedding dimensions to make normalization work
+            for idx in indices:
+                raw_importance_scores[feature_names[idx]] = feature_importance / n_repeats
+        
+        # Handle remaining individual features
         for i in range(n_features):
+            if i in processed_indices:
+                continue
+                
             feature_name = feature_names[i]
             feature_importance = 0.0
             
@@ -150,32 +262,66 @@ class PermutationImportance:
                 
                 # Get predictions with permuted feature
                 with torch.no_grad():
-                    permuted_preds = self.model.predict(**permuted_input)
+                    if sample_weights is not None:
+                        permuted_preds = self.model.predict(**permuted_input, sample_weights=sample_weights)
+                    else:
+                        permuted_preds = self.model.predict(**permuted_input)
                 
                 # Extract metric from permuted predictions
                 if metric == 'risk_score':
                     permuted_metric = permuted_preds['task_outputs'][task_name]['risk_score'].cpu().numpy()
                     # Compute mean absolute difference in risk scores
-                    importance = np.mean(np.abs(baseline_metric - permuted_metric))
+                    if sample_weights is not None:
+                        weights_np = sample_weights.cpu().numpy()
+                        importance = np.average(np.abs(baseline_metric - permuted_metric), weights=weights_np)
+                    else:
+                        importance = np.mean(np.abs(baseline_metric - permuted_metric))
                 elif metric == 'c_index' and y is not None:
                     # Compute c-index using survival targets
                     risk_scores = permuted_preds['task_outputs'][task_name]['risk_score'].cpu().numpy()
-                    permuted_metric = self._compute_c_index(risk_scores, event_time, event_indicator)
+                    if sample_weights is not None:
+                        weights_np = sample_weights.cpu().numpy()
+                        permuted_metric = self._compute_c_index(risk_scores, event_time, event_indicator, weights_np)
+                    else:
+                        permuted_metric = self._compute_c_index(risk_scores, event_time, event_indicator)
                     # Compute difference in c-index
                     importance = baseline_metric - permuted_metric
                 
                 feature_importance += importance
             
             # Average importance over repeats
-            importance_scores[feature_name] = feature_importance / n_repeats
+            raw_importance_scores[feature_name] = feature_importance / n_repeats
         
         # Normalize importance scores
-        max_importance = max(importance_scores.values())
-        if max_importance > 0:
-            for name in importance_scores:
-                importance_scores[name] /= max_importance
+        max_importance = max(raw_importance_scores.values())
+        normalized_scores = {}
         
-        return importance_scores
+        if max_importance > 0:
+            for name, value in raw_importance_scores.items():
+                normalized_scores[name] = value / max_importance
+        else:
+            normalized_scores = raw_importance_scores.copy()
+        
+        # Filter to return only one importance score per feature/category
+        final_scores = {}
+        processed_names = set()
+        
+        # Add categorical features first
+        for cat_name in cat_feature_groups.keys():
+            if cat_name not in processed_names:
+                final_scores[cat_name] = normalized_scores[cat_name]
+                processed_names.add(cat_name)
+        
+        # Add remaining features
+        for name, value in normalized_scores.items():
+            # Skip embedding dimensions and already processed names
+            if name in processed_names or any(name.startswith(f"{cat_info['name']}_embed_") for cat_info in (cat_feature_info or [])):
+                continue
+                
+            final_scores[name] = value
+            processed_names.add(name)
+        
+        return final_scores
     
     def plot_importance(
         self,
@@ -246,7 +392,8 @@ class PermutationImportance:
         self,
         risk_scores: np.ndarray,
         event_time: np.ndarray,
-        event_indicator: np.ndarray
+        event_indicator: np.ndarray,
+        sample_weights: Optional[np.ndarray] = None
     ) -> float:
         """
         Compute concordance index for survival predictions.
@@ -261,6 +408,9 @@ class PermutationImportance:
             
         event_indicator : np.ndarray
             Event indicators (1 if event occurred, 0 if censored)
+            
+        sample_weights : np.ndarray, optional
+            Sample weights for weighted c-index calculation
             
         Returns
         -------
@@ -277,6 +427,10 @@ class PermutationImportance:
         # Count comparable pairs
         comparable_pairs = 0
         
+        # Use uniform weights if none provided
+        if sample_weights is None:
+            sample_weights = np.ones(n_samples)
+            
         # Compute pairwise comparisons
         for i in range(n_samples):
             if event_indicator[i] == 0:
@@ -291,15 +445,18 @@ class PermutationImportance:
                     ((event_indicator[j] == 0 and event_time[j] > event_time[i]) or
                      (event_indicator[j] == 1 and event_time[i] < event_time[j]))):
                     
+                    # Calculate pair weight as product of individual weights
+                    pair_weight = sample_weights[i] * sample_weights[j]
+                    
                     # i should have a higher risk score than j
                     if risk_scores[i] > risk_scores[j]:
-                        concordant += 1
+                        concordant += pair_weight
                     elif risk_scores[i] < risk_scores[j]:
-                        discordant += 1
+                        discordant += pair_weight
                     else:
-                        tied_risk += 1
+                        tied_risk += pair_weight
                     
-                    comparable_pairs += 1
+                    comparable_pairs += pair_weight
         
         # Compute concordance index
         if comparable_pairs > 0:

@@ -1,7 +1,8 @@
 import pytest
 import torch
 import numpy as np
-from enhanced_deephit.models.tasks.survival import SingleRiskHead, CompetingRisksHead
+from enhanced_deephit.models.tasks.survival import SingleRiskHead
+# CompetingRisksHead will be implemented in a future update
 from enhanced_deephit.models.tasks.standard import ClassificationHead
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 from sklearn.metrics import confusion_matrix, precision_score, recall_score

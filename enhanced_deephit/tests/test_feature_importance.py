@@ -79,16 +79,16 @@ class TestFeatureImportance(unittest.TestCase):
             num_impute_strategy='mean',
             normalize='robust'
         )
-        self.processor.fit(self.df)
+        
+        # Only use feature columns for training, not target columns (time, event, time_bin)
+        feature_cols = [f'feature_{i}' for i in range(n_features)]
+        self.processor.fit(self.df[feature_cols])
         
         # Process features
-        self.df_processed = self.processor.transform(self.df)
+        self.df_processed = self.processor.transform(self.df[feature_cols])
         
         # Convert to tensors
-        self.X_tensor = torch.tensor(
-            self.df_processed[[f'feature_{i}' for i in range(n_features)]].values, 
-            dtype=torch.float32
-        )
+        self.X_tensor = torch.tensor(self.df_processed.values, dtype=torch.float32)
         self.target_tensor = torch.tensor(self.target, dtype=torch.float32)
         
         # Create dataset and dataloader with proper formatting

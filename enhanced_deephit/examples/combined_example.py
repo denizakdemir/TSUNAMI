@@ -76,14 +76,16 @@ def prepare_data(df, num_bins, competing_risks=False):
         num_impute_strategy='mean',
         normalize='robust'
     )
-    processor.fit(df)
+    
+    # Only use feature columns for fitting, not target columns (time, event, time_bin)
+    feature_cols = [col for col in df.columns if col.startswith('feature_')]
+    processor.fit(df[feature_cols])
     
     # Process features
-    df_processed = processor.transform(df)
+    df_processed = processor.transform(df[feature_cols])
     
     # Extract features and convert to tensor
-    feature_cols = [col for col in df.columns if col.startswith('feature_')]
-    X_tensor = torch.tensor(df_processed[feature_cols].values, dtype=torch.float32)
+    X_tensor = torch.tensor(df_processed.values, dtype=torch.float32)
     
     if not competing_risks:
         # Create target format for single risk

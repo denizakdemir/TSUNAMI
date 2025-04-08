@@ -119,7 +119,8 @@ class EnhancedDeepHit(nn.Module):
                targets: Optional[Dict[str, torch.Tensor]] = None,
                masks: Optional[Dict[str, torch.Tensor]] = None,
                categorical: Optional[torch.Tensor] = None,
-               missing_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+               missing_mask: Optional[torch.Tensor] = None,
+               sample_weights: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
         Forward pass through the EnhancedDeepHit model.
         
@@ -139,6 +140,9 @@ class EnhancedDeepHit(nn.Module):
             
         missing_mask : torch.Tensor, optional
             Missing value mask [batch_size, num_features]
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -163,7 +167,8 @@ class EnhancedDeepHit(nn.Module):
             task_results = self.task_manager(
                 x=encoder_output,
                 targets=targets,
-                masks=masks
+                masks=masks,
+                sample_weights=sample_weights
             )
             
             # Collect results
@@ -195,6 +200,7 @@ class EnhancedDeepHit(nn.Module):
                continuous: torch.Tensor,
                categorical: Optional[torch.Tensor] = None,
                missing_mask: Optional[torch.Tensor] = None,
+               sample_weights: Optional[torch.Tensor] = None,
                return_representations: bool = False,
                return_attention: bool = False) -> Dict[str, Any]:
         """
@@ -210,6 +216,9 @@ class EnhancedDeepHit(nn.Module):
             
         missing_mask : torch.Tensor, optional
             Missing value mask [batch_size, num_features]
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights [batch_size]
             
         return_representations : bool, default=False
             Whether to return encoder representations
@@ -230,7 +239,8 @@ class EnhancedDeepHit(nn.Module):
             results = self.forward(
                 continuous=continuous,
                 categorical=categorical,
-                missing_mask=missing_mask
+                missing_mask=missing_mask,
+                sample_weights=sample_weights
             )
             
             # Extract predictions
@@ -354,7 +364,8 @@ class EnhancedDeepHit(nn.Module):
            num_epochs: int = 100,
            patience: int = 10,
            optimize_metric: Optional[str] = None,
-           callbacks: Optional[List[Any]] = None) -> Dict[str, List[float]]:
+           callbacks: Optional[List[Any]] = None,
+           use_sample_weights: bool = False) -> Dict[str, List[float]]:
         """
         Train the model.
         
@@ -383,6 +394,9 @@ class EnhancedDeepHit(nn.Module):
             
         callbacks : List[Any], optional
             Callbacks for training process
+            
+        use_sample_weights : bool, default=False
+            Whether to use sample weights from the batches (should be provided in the 'sample_weights' key)
             
         Returns
         -------
@@ -437,6 +451,11 @@ class EnhancedDeepHit(nn.Module):
                 if masks is not None:
                     masks = {name: tensor.to(self.device) for name, tensor in masks.items()}
                 
+                # Extract sample weights if enabled
+                sample_weights = None
+                if use_sample_weights and 'sample_weights' in batch:
+                    sample_weights = batch['sample_weights'].to(self.device)
+                
                 # Zero gradients
                 optimizer.zero_grad()
                 
@@ -446,7 +465,8 @@ class EnhancedDeepHit(nn.Module):
                     targets=targets,
                     masks=masks,
                     categorical=categorical,
-                    missing_mask=missing_mask
+                    missing_mask=missing_mask,
+                    sample_weights=sample_weights
                 )
                 
                 # Extract loss
@@ -468,7 +488,7 @@ class EnhancedDeepHit(nn.Module):
             
             # Validation step if loader provided
             if val_loader is not None:
-                val_loss, val_metrics = self.evaluate(val_loader)
+                val_loss, val_metrics = self.evaluate(val_loader, use_sample_weights=use_sample_weights)
                 history['val_loss'].append(val_loss)
                 
                 # Update learning rate scheduler
@@ -528,7 +548,7 @@ class EnhancedDeepHit(nn.Module):
         
         return history
     
-    def evaluate(self, data_loader: torch.utils.data.DataLoader) -> Tuple[float, Dict[str, float]]:
+    def evaluate(self, data_loader: torch.utils.data.DataLoader, use_sample_weights: bool = False) -> Tuple[float, Dict[str, float]]:
         """
         Evaluate the model on a dataset.
         
@@ -536,6 +556,9 @@ class EnhancedDeepHit(nn.Module):
         ----------
         data_loader : torch.utils.data.DataLoader
             DataLoader for evaluation data
+            
+        use_sample_weights : bool, default=False
+            Whether to use sample weights from the batches
             
         Returns
         -------
@@ -572,13 +595,19 @@ class EnhancedDeepHit(nn.Module):
                 if masks is not None:
                     masks = {name: tensor.to(self.device) for name, tensor in masks.items()}
                 
+                # Extract sample weights if enabled
+                sample_weights = None
+                if use_sample_weights and 'sample_weights' in batch:
+                    sample_weights = batch['sample_weights'].to(self.device)
+                
                 # Forward pass
                 outputs = self.forward(
                     continuous=continuous,
                     targets=targets,
                     masks=masks,
                     categorical=categorical,
-                    missing_mask=missing_mask
+                    missing_mask=missing_mask,
+                    sample_weights=sample_weights
                 )
                 
                 # Extract loss

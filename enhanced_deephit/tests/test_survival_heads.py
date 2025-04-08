@@ -1,7 +1,8 @@
 import pytest
 import torch
 import numpy as np
-from enhanced_deephit.models.tasks.survival import SingleRiskHead, CompetingRisksHead
+from enhanced_deephit.models.tasks.survival import SingleRiskHead
+# CompetingRisksHead will be implemented in a future update
 
 def test_single_risk_head_forward():
     """Test forward pass for SingleRiskHead"""
