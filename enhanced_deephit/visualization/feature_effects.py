@@ -220,6 +220,10 @@ def plot_partial_dependence(
             ax.set_xticks(x_pos)
             ax.set_xticklabels(category_labels, rotation=45, ha='right')
             
+            # Set the x-axis label for the main plot
+            if xlabel == feature_name and 'original_name' in categorical_info:
+                ax.set_xlabel(categorical_info['original_name'])
+            
             # Add distribution as bar chart if requested
             if show_distribution and dist_ax is not None:
                 # Count instances in each category
@@ -255,9 +259,52 @@ def plot_partial_dependence(
             # Plot partial dependence
             ax.plot(grid_values, pd_values, 'b-', linewidth=2)
             
+            # If we're dealing with a categorical feature but displaying as continuous,
+            # we should still try to show category values on x-axis if available
+            if categorical_info and 'cardinality' in categorical_info:
+                # Get the category positions within the grid range
+                cardinality = categorical_info.get('cardinality', 1)
+                cat_positions = []
+                cat_labels = []
+                
+                # Map normalized indices back to original categories
+                reverse_mapping = categorical_info.get('reverse_mapping', {})
+                if reverse_mapping:
+                    for idx, label in reverse_mapping.items():
+                        # Calculate the position in the grid values
+                        pos = idx / cardinality
+                        # Check if this position falls within our grid range
+                        if feature_range[0] <= pos <= feature_range[1]:
+                            cat_positions.append(pos)
+                            cat_labels.append(str(label))
+                    
+                    # Set custom tick positions and labels if we have them
+                    if cat_positions and cat_labels:
+                        ax.set_xticks(cat_positions)
+                        ax.set_xticklabels(cat_labels, rotation=45, ha='right')
+            
             # Add feature distribution if requested
             if show_distribution and dist_ax is not None:
-                dist_ax.hist(feature_values, bins=30, alpha=0.5, density=True)
+                # For categorical features with continuous display, show histogram with categorical info
+                if categorical_info and 'cardinality' in categorical_info and 'reverse_mapping' in categorical_info:
+                    cardinality = categorical_info.get('cardinality', 1)
+                    reverse_mapping = categorical_info.get('reverse_mapping', {})
+                    
+                    # Try to create bins based on category positions
+                    if cat_positions and len(cat_positions) > 1:
+                        # Create histogram based on category positions
+                        dist_ax.hist(feature_values, bins=30, alpha=0.5, density=True)
+                        # Use the same tick positions and labels as the main plot
+                        if cat_positions and cat_labels:
+                            dist_ax.set_xticks(cat_positions)
+                            dist_ax.set_xticklabels(cat_labels, rotation=45, ha='right')
+                    else:
+                        # Standard histogram
+                        dist_ax.hist(feature_values, bins=30, alpha=0.5, density=True)
+                else:
+                    # Standard histogram for non-categorical features
+                    dist_ax.hist(feature_values, bins=30, alpha=0.5, density=True)
+                
                 dist_ax.set_ylabel('Density')
                 dist_ax.grid(True, alpha=0.3)
     else:

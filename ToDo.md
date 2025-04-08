@@ -73,6 +73,10 @@ class LinearAttention(nn.Module):
 - **Why**: While cause-specific metrics have been implemented, additional metrics would be valuable
 - **How**: Add more specialized metrics like cumulative incidence-based AUC
 
+**Recommendation**: Fix categorical feature display in visualization
+- **Why**: Categorical features should display the original category labels (not numeric indices) in plots
+- **How**: Updated feature_effects.py to properly handle and display categorical feature labels in plots
+
 ### 5. Deployment and Production
 
 **Recommendation**: Add model serialization with ONNX support

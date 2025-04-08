@@ -335,7 +335,17 @@ fig4 = plot_partial_dependence(
     feature_idx=categorical_idx,
     feature_name=categorical_feature_name,
     target='risk_score',
-    title=f"Partial Dependence of Risk Score on {categorical_feature_name}"
+    title=f"Partial Dependence of Risk Score on {categorical_feature_name}",
+    categorical_info={
+        'cardinality': 4,  # CML, AML, ALL, Missing
+        'embed_dim': 2,
+        'original_name': 'dissub',
+        'reverse_mapping': {
+            0: 'CML',
+            1: 'AML',
+            2: 'ALL'
+        }
+    }
 )
 fig4.savefig("plots/sr_pd_categorical1.png")
 plt.close(fig4)
@@ -350,7 +360,16 @@ fig5 = plot_partial_dependence(
     feature_idx=categorical_idx_other,
     feature_name=categorical_feature_name_other,
     target='risk_score',
-    title=f"Partial Dependence of Risk Score on {categorical_feature_name_other}"
+    title=f"Partial Dependence of Risk Score on {categorical_feature_name_other}",
+    categorical_info={
+        'cardinality': 3,  # No gender mismatch, Gender mismatch, Missing
+        'embed_dim': 2,
+        'original_name': 'drmatch',
+        'reverse_mapping': {
+            0: 'No gender mismatch',
+            1: 'Gender mismatch'
+        }
+    }
 )
 fig5.savefig("plots/sr_pd_categorical.png")
 plt.close(fig5)
@@ -365,7 +384,8 @@ fig6 = plot_ice_curves(
     feature_idx=categorical_idx2,
     feature_name=categorical_feature_name2,
     target='risk_score',
-    title=f"ICE Curves for {categorical_feature_name2}"
+    title=f"ICE Curves for {categorical_feature_name2}",
+    feature_range=(0, 0.5)  # Limit to the range where our categories are
 )
 fig6.savefig("plots/sr_ice_curves.png")
 plt.close(fig6)
