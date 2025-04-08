@@ -63,7 +63,8 @@ class ClassificationHead(TaskHead):
     def forward(self, 
                x: torch.Tensor, 
                targets: Optional[torch.Tensor] = None, 
-               mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+               mask: Optional[torch.Tensor] = None,
+               sample_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass for classification prediction.
         
@@ -78,6 +79,9 @@ class ClassificationHead(TaskHead):
         mask : torch.Tensor, optional
             Mask indicating which samples have targets for this task
             [batch_size], where 1 means target is available
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -130,6 +134,13 @@ class ClassificationHead(TaskHead):
                 valid_samples = float(batch_size)
                 mask = torch.ones_like(targets, dtype=torch.float, device=device)
             
+            # Apply sample weights if provided
+            if sample_weights is not None:
+                # Combine with mask
+                combined_weights = mask * sample_weights
+            else:
+                combined_weights = mask
+            
             # Skip loss computation if no valid samples
             if valid_samples > 0:
                 # Compute loss
@@ -138,8 +149,8 @@ class ClassificationHead(TaskHead):
                     loss_fn = nn.BCEWithLogitsLoss(reduction='none')
                     loss_values = loss_fn(logits, targets.float())
                     
-                    # Apply mask and normalize
-                    loss = torch.sum(loss_values * mask) / valid_samples
+                    # Apply combined weights and normalize
+                    loss = torch.sum(loss_values * combined_weights) / torch.sum(combined_weights)
                 else:
                     # Multi-class cross-entropy loss
                     if self.class_weights is not None:
@@ -151,8 +162,8 @@ class ClassificationHead(TaskHead):
                     
                     loss_values = loss_fn(logits, targets)
                     
-                    # Apply mask and normalize
-                    loss = torch.sum(loss_values * mask) / valid_samples
+                    # Apply combined weights and normalize
+                    loss = torch.sum(loss_values * combined_weights) / torch.sum(combined_weights)
         
         return {
             'loss': loss,
@@ -375,7 +386,8 @@ class RegressionHead(TaskHead):
     def forward(self, 
                x: torch.Tensor, 
                targets: Optional[torch.Tensor] = None, 
-               mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+               mask: Optional[torch.Tensor] = None,
+               sample_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass for regression prediction.
         
@@ -390,6 +402,9 @@ class RegressionHead(TaskHead):
         mask : torch.Tensor, optional
             Mask indicating which samples have targets for this task
             [batch_size, output_dim], where 1 means target is available
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -439,6 +454,17 @@ class RegressionHead(TaskHead):
                 valid_samples = float(batch_size * targets.size(1))
                 mask = torch.ones_like(targets, dtype=torch.float, device=device)
             
+            # Apply sample weights if provided
+            if sample_weights is not None:
+                # Need to expand sample_weights to match the dimensions of mask
+                if targets.dim() > 1 and sample_weights.dim() == 1:
+                    expanded_weights = sample_weights.unsqueeze(1).expand(-1, targets.size(1))
+                    combined_weights = mask * expanded_weights
+                else:
+                    combined_weights = mask * sample_weights
+            else:
+                combined_weights = mask
+            
             # Skip loss computation if no valid samples
             if valid_samples > 0:
                 # Safeguard against NaN values
@@ -450,13 +476,13 @@ class RegressionHead(TaskHead):
                     # Quantile regression loss
                     # Handle NaN in quantile predictions
                     quantile_preds_safe = torch.nan_to_num(quantile_preds, nan=0.0)
-                    loss = self._compute_quantile_loss(quantile_preds_safe, targets_safe, mask)
+                    loss = self._compute_quantile_loss(quantile_preds_safe, targets_safe, combined_weights)
                 else:
                     # Standard regression loss
                     loss_values = self.loss_fn(predictions_safe, targets_safe)
                     
-                    # Apply mask and normalize
-                    loss = torch.sum(loss_values * mask) / valid_samples
+                    # Apply combined weights and normalize
+                    loss = torch.sum(loss_values * combined_weights) / torch.sum(combined_weights)
         
         # Prepare output dictionary
         outputs = {
@@ -494,7 +520,7 @@ class RegressionHead(TaskHead):
         
         return outputs
     
-    def _compute_quantile_loss(self, quantile_preds: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _compute_quantile_loss(self, quantile_preds: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         """
         Compute quantile regression loss.
         
@@ -506,8 +532,9 @@ class RegressionHead(TaskHead):
         targets : torch.Tensor
             Target values [batch_size, output_dim]
             
-        mask : torch.Tensor
-            Mask indicating which samples have targets [batch_size, output_dim]
+        weights : torch.Tensor
+            Weights for loss calculation (can include both mask and sample weights)
+            [batch_size, output_dim]
             
         Returns
         -------
@@ -522,9 +549,9 @@ class RegressionHead(TaskHead):
         # [batch_size, output_dim] -> [batch_size, output_dim, num_quantiles]
         expanded_targets = targets.unsqueeze(-1).expand(-1, -1, n_quantiles)
         
-        # Expand mask for each quantile
+        # Expand weights for each quantile
         # [batch_size, output_dim] -> [batch_size, output_dim, num_quantiles]
-        expanded_mask = mask.unsqueeze(-1).expand(-1, -1, n_quantiles)
+        expanded_weights = weights.unsqueeze(-1).expand(-1, -1, n_quantiles)
         
         # Initialize quantile loss
         q_loss = torch.zeros(batch_size, self.output_dim, n_quantiles, device=device)
@@ -539,12 +566,12 @@ class RegressionHead(TaskHead):
             q_tensor = torch.ones_like(errors, device=device) * q
             q_loss[:, :, i] = torch.max(q_tensor * errors, (q_tensor - 1) * errors)
         
-        # Apply mask and normalize
-        q_loss = q_loss * expanded_mask
-        valid_samples = torch.sum(expanded_mask)
+        # Apply weights and normalize
+        q_loss = q_loss * expanded_weights
+        weight_sum = torch.sum(expanded_weights)
         
-        if valid_samples > 0:
-            q_loss = torch.sum(q_loss) / valid_samples
+        if weight_sum > 0:
+            q_loss = torch.sum(q_loss) / weight_sum
         else:
             q_loss = torch.tensor(0.0, device=device)
         
@@ -718,7 +745,8 @@ class CountDataHead(TaskHead):
                x: torch.Tensor, 
                targets: Optional[torch.Tensor] = None, 
                mask: Optional[torch.Tensor] = None,
-               exposure: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+               exposure: Optional[torch.Tensor] = None,
+               sample_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass for count data prediction.
         
@@ -736,6 +764,9 @@ class CountDataHead(TaskHead):
             
         exposure : torch.Tensor, optional
             Exposure values for rate adjustment [batch_size]
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -836,6 +867,13 @@ class CountDataHead(TaskHead):
                 valid_samples = float(batch_size)
                 mask = torch.ones_like(targets, dtype=torch.float, device=device)
             
+            # Apply sample weights if provided
+            if sample_weights is not None:
+                # Combine with mask
+                combined_weights = mask * sample_weights
+            else:
+                combined_weights = mask
+            
             # Skip loss computation if no valid samples
             if valid_samples > 0:
                 # Compute negative log-likelihood based on distribution
@@ -854,8 +892,8 @@ class CountDataHead(TaskHead):
                         # Standard negative binomial log-likelihood
                         ll = self._compute_nb_log_likelihood(rate.squeeze(-1), dispersion.squeeze(-1), targets)
                 
-                # Apply mask and compute mean negative log-likelihood
-                nll = -torch.sum(ll * mask) / valid_samples
+                # Apply combined weights and compute weighted negative log-likelihood
+                nll = -torch.sum(ll * combined_weights) / torch.sum(combined_weights)
                 loss = nll
         
         # Add loss to results
@@ -863,7 +901,7 @@ class CountDataHead(TaskHead):
         
         return results
     
-    def predict(self, x: torch.Tensor, exposure: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def predict(self, x: torch.Tensor, exposure: Optional[torch.Tensor] = None, sample_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Generate count data predictions.
         
@@ -875,13 +913,16 @@ class CountDataHead(TaskHead):
         exposure : torch.Tensor, optional
             Exposure values for rate adjustment [batch_size]
             
+        sample_weights : torch.Tensor, optional
+            Sample weights [batch_size]
+            
         Returns
         -------
         Dict[str, torch.Tensor]
             Dictionary containing model predictions
         """
         # Compute predictions (no loss)
-        outputs = self.forward(x, exposure=exposure)
+        outputs = self.forward(x, exposure=exposure, sample_weights=sample_weights)
         
         # Remove loss from outputs
         outputs.pop('loss', None)

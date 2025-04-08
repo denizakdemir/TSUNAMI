@@ -71,7 +71,8 @@ class SingleRiskHead(TaskHead):
     def forward(self, 
                x: torch.Tensor, 
                targets: Optional[torch.Tensor] = None, 
-               mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+               mask: Optional[torch.Tensor] = None,
+               sample_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass for single-risk survival prediction.
         
@@ -89,6 +90,9 @@ class SingleRiskHead(TaskHead):
         mask : torch.Tensor, optional
             Mask indicating which samples have targets for this task
             [batch_size], where 1 means target is available
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -163,6 +167,13 @@ class SingleRiskHead(TaskHead):
                 valid_samples = float(batch_size)
                 mask = torch.ones_like(event_indicator)
             
+            # Apply sample weights if provided
+            if sample_weights is not None:
+                # Combine with mask
+                combined_weights = mask * sample_weights
+            else:
+                combined_weights = mask
+                
             # Skip loss computation if no valid samples
             if valid_samples > 0:
                 if self.use_bce_loss:
@@ -197,6 +208,13 @@ class SingleRiskHead(TaskHead):
                                 
                                 # Mask includes only up to censoring (exclusive)
                                 bce_mask[i, :t] = 1
+                    
+                    # Apply sample weights to BCE mask if provided
+                    if sample_weights is not None:
+                        weighted_bce_mask = torch.zeros_like(bce_mask)
+                        for i in range(batch_size):
+                            weighted_bce_mask[i] = bce_mask[i] * sample_weights[i]
+                        bce_mask = weighted_bce_mask
                     
                     # Compute BCE loss
                     bce_loss = F.binary_cross_entropy(
@@ -240,19 +258,26 @@ class SingleRiskHead(TaskHead):
                                 # Add sum of log(1-hazard) up to censoring time
                                 nll[i] = -torch.sum(log_1_minus_hazard[i, :t])
                     
-                    # Compute mean NLL for valid samples
-                    nll = torch.sum(nll * mask) / (valid_samples + 1e-6)
+                    # Compute weighted mean NLL for valid samples
+                    weighted_nll = nll * combined_weights
+                    nll = torch.sum(weighted_nll) / (torch.sum(combined_weights) + 1e-6)
                     loss = nll
                 
                 # Add ranking loss if alpha_rank > 0
                 if self.alpha_rank > 0:
-                    # Compute concordance loss
-                    rank_loss = self._compute_ranking_loss(risk_score, event_indicator, event_time, mask)
+                    # Compute concordance loss - pass sample weights if available
+                    if sample_weights is not None:
+                        rank_loss = self._compute_ranking_loss(risk_score, event_indicator, event_time, mask, sample_weights)
+                    else:
+                        rank_loss = self._compute_ranking_loss(risk_score, event_indicator, event_time, mask)
                     loss = loss + self.alpha_rank * rank_loss
                 
                 # Add calibration loss if alpha_calibration > 0
                 if self.alpha_calibration > 0:
-                    calibration_loss = self._compute_calibration_loss(survival, event_indicator, event_time, mask)
+                    if sample_weights is not None:
+                        calibration_loss = self._compute_calibration_loss(survival, event_indicator, event_time, mask, sample_weights)
+                    else:
+                        calibration_loss = self._compute_calibration_loss(survival, event_indicator, event_time, mask)
                     loss = loss + self.alpha_calibration * calibration_loss
         
         return {
@@ -297,23 +322,18 @@ class SingleRiskHead(TaskHead):
             Model outputs from the forward pass
             
         targets : torch.Tensor
-            Ground truth targets with shape [batch_size, 2 + num_time_bins]:
-            - targets[:, 0]: Event indicator (1 if event occurred, 0 if censored)
-            - targets[:, 1]: Time bin index where event/censoring occurred
-            - targets[:, 2:]: One-hot encoding of event time (for convenience)
+            Ground truth targets
             
         Returns
         -------
         Dict[str, float]
-            Dictionary of metric names and values:
-            - 'c_index': Concordance index
-            - 'brier_score': Integrated Brier score
-            - 'auc': Time-dependent AUC
+            Dictionary of metric names and values
         """
-        # Extract predictions and targets
+        # Extract predictions
         risk_scores = outputs['risk_score'].detach().cpu().numpy()
         survival = outputs['survival'].detach().cpu().numpy()
         
+        # Extract targets
         event_indicator = targets[:, 0].detach().cpu().numpy()
         event_time = targets[:, 1].detach().cpu().numpy()
         
@@ -336,7 +356,8 @@ class SingleRiskHead(TaskHead):
                              risk_scores: torch.Tensor, 
                              event_indicator: torch.Tensor, 
                              event_time: torch.Tensor,
-                             mask: torch.Tensor) -> torch.Tensor:
+                             mask: torch.Tensor,
+                             sample_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Compute ranking loss for concordance optimization.
         
@@ -353,6 +374,9 @@ class SingleRiskHead(TaskHead):
             
         mask : torch.Tensor
             Mask indicating valid samples [batch_size]
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -392,8 +416,15 @@ class SingleRiskHead(TaskHead):
                     # Compute hinge loss: max(0, 1 - (risk_i - risk_j))
                     pair_loss = torch.relu(1.0 + risk_diff)
                     
-                    loss = loss + pair_loss
-                    valid_comparisons += 1
+                    # Apply sample weights if provided
+                    if sample_weights is not None:
+                        # Weight the pair loss by the product of both sample weights
+                        pair_weight = sample_weights[i] * sample_weights[j]
+                        loss = loss + pair_loss * pair_weight
+                        valid_comparisons += pair_weight
+                    else:
+                        loss = loss + pair_loss
+                        valid_comparisons += 1
         
         # Normalize loss by number of valid comparisons
         if valid_comparisons > 0:
@@ -405,7 +436,8 @@ class SingleRiskHead(TaskHead):
                                  survival: torch.Tensor,
                                  event_indicator: torch.Tensor,
                                  event_time: torch.Tensor,
-                                 mask: torch.Tensor) -> torch.Tensor:
+                                 mask: torch.Tensor,
+                                 sample_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Compute calibration loss to ensure predicted probabilities match empirical frequencies.
         
@@ -423,6 +455,9 @@ class SingleRiskHead(TaskHead):
         mask : torch.Tensor
             Mask indicating valid samples [batch_size]
             
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
+            
         Returns
         -------
         torch.Tensor
@@ -437,61 +472,41 @@ class SingleRiskHead(TaskHead):
         # Initialize loss
         loss = torch.tensor(0.0, device=device)
         
-        # For each time bin, compute expected vs observed event counts
+        # For each time bin
         for t in range(num_bins):
-            # Samples at risk at time t (not having events before t)
-            at_risk = (event_time >= t) & (mask > 0)
-            num_at_risk = torch.sum(at_risk)
+            # Count events that occur at or before time t
+            events_at_t = torch.zeros(batch_size, device=device)
             
-            if num_at_risk > 0:
-                # Expected number of events at time t based on predicted hazards
-                hazard_t = 1.0 - survival[:, t] / torch.where(t > 0, survival[:, t-1], torch.ones_like(survival[:, 0]))
-                expected_events = torch.sum(hazard_t[at_risk])
+            for i in range(batch_size):
+                if mask[i] > 0 and event_indicator[i] > 0 and event_time[i] <= t:
+                    events_at_t[i] = 1.0
+            
+            # Calculate empirical probability of event by time t
+            if sample_weights is not None:
+                weighted_events = events_at_t * sample_weights * mask
+                weighted_mask = mask * sample_weights
+                empirical_prob = torch.sum(weighted_events) / (torch.sum(weighted_mask) + 1e-6)
+            else:
+                empirical_prob = torch.sum(events_at_t * mask) / (torch.sum(mask) + 1e-6)
                 
-                # Observed number of events at time t
-                observed_events = torch.sum((event_time == t) & (event_indicator == 1) & at_risk)
-                
-                # Squared difference between expected and observed
-                bin_loss = (expected_events - observed_events).pow(2) / num_at_risk
-                loss = loss + bin_loss
+            # Calculate predicted probability of event by time t
+            predicted_prob = 1.0 - torch.mean(survival[:, t])
+            
+            # L2 loss between predicted and empirical probabilities
+            bin_loss = (predicted_prob - empirical_prob).pow(2)
+            loss = loss + bin_loss
         
-        # Normalize by number of time bins
+        # Average over all time bins
         loss = loss / num_bins
         
         return loss
     
-    def _compute_c_index(self, risk_scores: np.ndarray, event_time: np.ndarray, event_indicator: np.ndarray) -> float:
-        """
-        Compute concordance index for survival predictions.
-        
-        Parameters
-        ----------
-        risk_scores : np.ndarray
-            Predicted risk scores
-            
-        event_time : np.ndarray
-            Event times
-            
-        event_indicator : np.ndarray
-            Event indicators (1 if event occurred, 0 if censored)
-            
-        Returns
-        -------
-        float
-            Concordance index
-        """
-        # For convenience, using NumPy for this computation
+    def _compute_c_index(self, risk_scores, event_time, event_indicator):
+        """Compute concordance index from risk scores and event data."""
         n_samples = len(risk_scores)
+        concordant_pairs = 0
+        total_pairs = 0
         
-        # Initialize counters
-        concordant = 0
-        discordant = 0
-        tied_risk = 0
-        
-        # Count comparable pairs
-        comparable_pairs = 0
-        
-        # Compute pairwise comparisons
         for i in range(n_samples):
             if event_indicator[i] == 0:
                 # Skip censored samples for first position
@@ -505,892 +520,123 @@ class SingleRiskHead(TaskHead):
                     ((event_indicator[j] == 0 and event_time[j] > event_time[i]) or
                      (event_indicator[j] == 1 and event_time[i] < event_time[j]))):
                     
-                    # i should have a higher risk score than j
-                    if risk_scores[i] > risk_scores[j]:
-                        concordant += 1
-                    elif risk_scores[i] < risk_scores[j]:
-                        discordant += 1
-                    else:
-                        tied_risk += 1
+                    total_pairs += 1
                     
-                    comparable_pairs += 1
+                    # Higher risk score should predict earlier event
+                    if risk_scores[i] > risk_scores[j]:
+                        concordant_pairs += 1
+                    elif risk_scores[i] == risk_scores[j]:
+                        concordant_pairs += 0.5
         
-        # Compute concordance index
-        if comparable_pairs > 0:
-            return (concordant + 0.5 * tied_risk) / comparable_pairs
+        # Return c-index (proportion of concordant pairs)
+        if total_pairs == 0:
+            return 0.5
         else:
-            return 0.5  # Default value when no comparable pairs exist
+            return concordant_pairs / total_pairs
     
-    def _compute_integrated_brier_score(self, survival: np.ndarray, event_time: np.ndarray, event_indicator: np.ndarray) -> float:
-        """
-        Compute integrated Brier score for survival predictions.
+    def _compute_integrated_brier_score(self, survival, event_time, event_indicator):
+        """Compute integrated Brier score."""
+        n_samples = len(event_time)
+        n_time_bins = survival.shape[1]
         
-        Parameters
-        ----------
-        survival : np.ndarray
-            Predicted survival functions [batch_size, num_time_bins]
-            
-        event_time : np.ndarray
-            Event times
-            
-        event_indicator : np.ndarray
-            Event indicators (1 if event occurred, 0 if censored)
-            
-        Returns
-        -------
-        float
-            Integrated Brier score
-        """
-        # Number of time bins
-        num_bins = survival.shape[1]
+        # Initialize Brier score for each time point
+        brier_scores = np.zeros(n_time_bins)
         
-        # Initialize Brier scores for each time point
-        brier_scores = np.zeros(num_bins)
-        
-        # Compute Brier score at each time point
-        for t in range(num_bins):
-            # Observed survival status at time t
-            # 1 if alive at time t, 0 if event before t
-            observed = (event_time > t).astype(float)
+        # For each time bin
+        for t in range(n_time_bins):
+            brier_score_t = 0.0
+            weight_sum = 0.0
             
-            # For censored before t, we don't have ground truth
-            # Exclude these from the computation
-            mask = (event_indicator == 1) | (event_time > t)
+            for i in range(n_samples):
+                # Observed outcome at time t
+                Y_t = 0.0  # Default: survived past time t
+                weight = 1.0  # Default weight
+                
+                if event_indicator[i] == 1 and event_time[i] <= t:
+                    # Event before or at time t
+                    Y_t = 1.0
+                elif event_time[i] <= t:
+                    # Censored before or at time t, undefined true outcome
+                    weight = 0.0
+                
+                # Skip if weight is zero
+                if weight > 0:
+                    # Predicted probability of event by time t
+                    pred_t = 1 - survival[i, t]
+                    
+                    # Squared error weighted by inverse probability of censoring
+                    brier_score_t += weight * (Y_t - pred_t) ** 2
+                    weight_sum += weight
             
-            if np.sum(mask) > 0:
-                # Compute squared error between predicted and observed
-                brier_scores[t] = np.mean(((survival[:, t] - observed) ** 2)[mask])
+            # Average over samples with non-zero weights
+            if weight_sum > 0:
+                brier_scores[t] = brier_score_t / weight_sum
         
-        # Compute mean Brier score across all time points
+        # Compute integrated score (mean over time)
         return np.mean(brier_scores)
     
-    def _compute_time_dependent_auc(self, risk_scores: np.ndarray, event_time: np.ndarray, event_indicator: np.ndarray) -> float:
-        """
-        Compute time-dependent AUC for survival predictions.
+    def _compute_time_dependent_auc(self, risk_scores, event_time, event_indicator):
+        """Compute time-dependent AUC."""
+        n_samples = len(risk_scores)
+        n_auc_points = 0
+        auc_sum = 0.0
         
-        Parameters
-        ----------
-        risk_scores : np.ndarray
-            Predicted risk scores
-            
-        event_time : np.ndarray
-            Event times
-            
-        event_indicator : np.ndarray
-            Event indicators (1 if event occurred, 0 if censored)
-            
-        Returns
-        -------
-        float
-            Mean time-dependent AUC
-        """
-        # Number of unique event times
-        unique_times = np.unique(event_time[event_indicator == 1])
+        # For a few representative time points
+        evaluation_times = np.percentile(event_time[event_indicator == 1], [25, 50, 75])
         
-        if len(unique_times) == 0:
-            return 0.5  # Default value when no events
-        
-        # Initialize AUCs for each time point
-        aucs = np.zeros(len(unique_times))
-        
-        # Compute AUC at each time point
-        for i, t in enumerate(unique_times):
-            # Positive class: samples with events at time t
-            positives = (event_time == t) & (event_indicator == 1)
+        for eval_time in evaluation_times:
+            # Initialize counts for this time point
+            true_positives = np.zeros(n_samples)
+            false_positives = np.zeros(n_samples)
             
-            # Negative class: samples alive after time t
-            negatives = event_time > t
+            # Count positive cases: had an event by eval_time
+            # Count negative cases: no event by eval_time (censored after or event after)
+            positives = (event_indicator == 1) & (event_time <= eval_time)
+            negatives = (event_time > eval_time)
             
-            # Skip if no positives or negatives
             if np.sum(positives) == 0 or np.sum(negatives) == 0:
-                aucs[i] = 0.5
+                # Skip this time point if no positives or negatives
                 continue
+                
+            # Sort samples by risk score (descending)
+            sorted_indices = np.argsort(-risk_scores)
             
-            # Extract risk scores for positives and negatives
-            pos_scores = risk_scores[positives]
-            neg_scores = risk_scores[negatives]
+            # Compute TPR and FPR at each threshold
+            tp_count = 0
+            fp_count = 0
             
-            # Compute AUC by comparing all pairs
-            n_pos = len(pos_scores)
-            n_neg = len(neg_scores)
+            for idx in sorted_indices:
+                if positives[idx]:
+                    tp_count += 1
+                elif negatives[idx]:
+                    fp_count += 1
+                
+                true_positives[idx] = tp_count / np.sum(positives)
+                false_positives[idx] = fp_count / np.sum(negatives)
             
-            # Count concordant pairs
-            concordant = 0
+            # Compute AUC using trapezoidal rule
+            sorted_fps = false_positives[sorted_indices]
+            sorted_tps = true_positives[sorted_indices]
             
-            for pos_score in pos_scores:
-                concordant += np.sum(pos_score > neg_scores)
-                concordant += 0.5 * np.sum(pos_score == neg_scores)
+            # Compute area using trapezoidal rule
+            time_auc = np.trapz(sorted_tps, sorted_fps)
             
-            # Compute AUC
-            aucs[i] = concordant / (n_pos * n_neg)
-        
-        # Return mean AUC across all time points
-        return np.mean(aucs)
+            auc_sum += time_auc
+            n_auc_points += 1
+            
+        # Average AUC over evaluation times
+        if n_auc_points > 0:
+            return auc_sum / n_auc_points
+        else:
+            return 0.5
     
     def get_config(self) -> Dict[str, Any]:
-        """
-        Get configuration dictionary for serialization.
-        
-        Returns
-        -------
-        Dict[str, Any]
-            Configuration dictionary
-        """
+        """Get configuration dictionary for serialization."""
         config = super().get_config()
         config.update({
             'num_time_bins': self.num_time_bins,
             'alpha_rank': self.alpha_rank,
             'alpha_calibration': self.alpha_calibration,
             'use_bce_loss': self.use_bce_loss
-        })
-        return config
-
-
-class CompetingRisksHead(TaskHead):
-    """
-    Task head for competing risks survival analysis.
-    
-    Predicts the probability of different event types occurring at each time point,
-    handling right-censoring through masked loss computation.
-    """
-    
-    def __init__(self,
-                name: str,
-                input_dim: int,
-                num_time_bins: int,
-                num_risks: int,
-                alpha_rank: float = 0.0,
-                alpha_calibration: float = 0.0,
-                task_weight: float = 1.0,
-                use_softmax: bool = True,
-                use_cause_specific: bool = False,
-                dropout: float = 0.1):
-        """
-        Initialize CompetingRisksHead.
-        
-        Parameters
-        ----------
-        name : str
-            Name of the task
-            
-        input_dim : int
-            Dimension of the input representation
-            
-        num_time_bins : int
-            Number of discrete time bins to predict
-            
-        num_risks : int
-            Number of competing risks (event types)
-            
-        alpha_rank : float, default=0.0
-            Weight of the ranking loss component
-            
-        alpha_calibration : float, default=0.0
-            Weight of the calibration loss component
-            
-        task_weight : float, default=1.0
-            Weight of this task in the multi-task loss
-            
-        use_softmax : bool, default=True
-            Whether to use softmax for cause probabilities (True) or independent sigmoids (False)
-            
-        use_cause_specific : bool, default=False
-            Whether to use cause-specific networks (True) or shared network (False)
-            
-        dropout : float, default=0.1
-            Dropout rate for the prediction network
-        """
-        super().__init__(name, input_dim, task_weight)
-        
-        self.num_time_bins = num_time_bins
-        self.num_risks = num_risks
-        self.alpha_rank = alpha_rank
-        self.alpha_calibration = alpha_calibration
-        self.use_softmax = use_softmax
-        self.use_cause_specific = use_cause_specific
-        
-        # Architecture
-        if use_cause_specific:
-            # Separate network for each cause
-            self.shared_network = nn.Sequential(
-                nn.Linear(input_dim, input_dim * 2),
-                nn.LayerNorm(input_dim * 2),
-                nn.GELU(),
-                nn.Dropout(dropout)
-            )
-            
-            self.cause_networks = nn.ModuleList([
-                nn.Linear(input_dim * 2, num_time_bins) 
-                for _ in range(num_risks)
-            ])
-        else:
-            # Single network with multi-output head
-            self.prediction_network = nn.Sequential(
-                nn.Linear(input_dim, input_dim * 2),
-                nn.LayerNorm(input_dim * 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(input_dim * 2, num_time_bins * num_risks)
-            )
-            
-    def forward(self, 
-               x: torch.Tensor, 
-               targets: Optional[torch.Tensor] = None, 
-               mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for competing risks prediction.
-        
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input representation [batch_size, input_dim]
-            
-        targets : torch.Tensor, optional
-            Target values with shape [batch_size, 2 + num_risks * num_time_bins]:
-            - targets[:, 0]: Event indicator (1 if any event occurred, 0 if censored)
-            - targets[:, 1]: Time bin index where event/censoring occurred
-            - targets[:, 2]: Cause index (0 to num_risks-1, or -1 if censored)
-            - targets[:, 3:]: One-hot encoding of event time and cause (for convenience)
-            
-        mask : torch.Tensor, optional
-            Mask indicating which samples have targets for this task
-            [batch_size], where 1 means target is available
-            
-        Returns
-        -------
-        Dict[str, torch.Tensor]
-            Dictionary containing:
-            - 'loss': Loss for this task (if targets provided)
-            - 'cause_hazards': Predicted cause-specific hazards [batch_size, num_risks, num_time_bins]
-            - 'overall_survival': Predicted overall survival function [batch_size, num_time_bins]
-            - 'cif': Cumulative incidence functions [batch_size, num_risks, num_time_bins]
-            - 'risk_scores': Cause-specific risk scores [batch_size, num_risks]
-        """
-        # Get batch size and device
-        batch_size = x.size(0)
-        device = x.device
-        
-        # Compute raw predictions
-        if self.use_cause_specific:
-            # Shared representation
-            shared_features = self.shared_network(x)
-            
-            # Cause-specific predictions
-            cause_logits = []
-            for i in range(self.num_risks):
-                cause_logits.append(self.cause_networks[i](shared_features))
-                
-            # Stack along cause dimension
-            cause_logits = torch.stack(cause_logits, dim=1)  # [batch_size, num_risks, num_time_bins]
-        else:
-            # Single network prediction
-            outputs = self.prediction_network(x)
-            
-            # Reshape to [batch_size, num_risks, num_time_bins]
-            cause_logits = outputs.view(batch_size, self.num_risks, self.num_time_bins)
-        
-        # Compute cause-specific hazards
-        if self.use_softmax:
-            # Add an additional dimension for "no event"
-            # [batch_size, num_risks + 1, num_time_bins]
-            padded_logits = torch.cat([
-                torch.zeros(batch_size, 1, self.num_time_bins, device=device),
-                cause_logits
-            ], dim=1)
-            
-            # Apply softmax for each time point
-            # This enforces that at each time point, probabilities sum to 1 across all causes (including no event)
-            probs = F.softmax(padded_logits, dim=1)
-            
-            # Extract cause-specific hazards (excluding "no event")
-            cause_hazards = probs[:, 1:, :]
-            
-            # Probability of no event
-            no_event_prob = probs[:, 0, :]
-        else:
-            # Apply sigmoid for independent cause-specific hazards
-            cause_hazards = torch.sigmoid(cause_logits)
-            
-            # Probability of no event = probability of not having any of the events
-            no_event_prob = torch.prod(1 - cause_hazards, dim=1)
-        
-        # Compute overall survival function based on the discrete-time survival model
-        # In discrete time:
-        # S(0) = 1 (by definition)
-        # S(t) = Prob(T > t) = Prob(no event at times 1, 2, ..., t)
-        # S(t) = (1-h_total(1)) * (1-h_total(2)) * ... * (1-h_total(t)) for t >= 1
-        # where h_total(t) = probability of any event at time t
-        
-        # Initialize overall survival with ones for S(0)
-        overall_survival = torch.ones(batch_size, self.num_time_bins, device=device)
-        
-        # Compute S(t) using the correct definition
-        # S(t) = product from j=1 to t of (no_event_prob(j))
-        overall_survival[:, 1:] = torch.cumprod(no_event_prob[:, :-1], dim=1)
-        
-        # Compute cumulative incidence functions for each cause
-        # In the competing risks setting:
-        # F_k(t) = Prob(T ≤ t, Cause = k) = probability of event of type k by time t
-        # F_k(0) = 0 (by definition, no events at time 0)
-        # F_k(t) = sum from j=1 to t of S(j-1) * h_k(j)
-        # Where h_k(j) is the cause-specific hazard for cause k at time j
-        
-        # Initialize CIF starting at 0 for all risks
-        cif = torch.zeros(batch_size, self.num_risks, self.num_time_bins, device=device)
-        
-        # By definition, F_k(0) = 0 (no events at time 0)
-        # For t ≥ 1, compute CIF using correct formula
-        for t in range(1, self.num_time_bins):
-            # Get survival up to time t-1
-            prev_survival = overall_survival[:, t-1]
-            
-            # Calculate probability of event of type k at time t
-            # P(T=t, Cause=k) = S(t-1) * h_k(t)
-            event_probs = cause_hazards[:, :, t-1] * prev_survival.unsqueeze(1)
-            
-            # Add to cumulative incidence
-            cif[:, :, t] = cif[:, :, t-1] + event_probs
-        
-        # Compute cause-specific risk scores (negative expected survival time for each cause)
-        risk_scores = torch.sum(cif, dim=2)
-        
-        # Initialize loss
-        loss = torch.tensor(0.0, device=device)
-        
-        # If targets are provided, compute the loss
-        if targets is not None:
-            # Extract event indicator, time index, and cause
-            event_indicator = targets[:, 0]
-            event_time = targets[:, 1].long()
-            event_cause = targets[:, 2].long()  # -1 if censored
-            
-            # Apply task mask if provided
-            if mask is not None:
-                # Expand mask to match event indicator
-                mask = mask.float()
-                event_indicator = event_indicator * mask
-                
-                # Count valid samples for loss normalization
-                valid_samples = torch.sum(mask)
-            else:
-                # All samples are valid
-                valid_samples = float(batch_size)
-                mask = torch.ones_like(event_indicator)
-            
-            # Skip loss computation if no valid samples
-            if valid_samples > 0:
-                # Negative log-likelihood loss
-                nll = torch.zeros(batch_size, device=device)
-                
-                # Compute likelihood for each sample
-                for i in range(batch_size):
-                    if mask[i] > 0:  # If this sample has a valid target
-                        t = event_time[i]
-                        
-                        if event_indicator[i] > 0:  # Event occurred
-                            # Add log probability of the specific cause at time t
-                            cause = event_cause[i]
-                            
-                            # Probability of this specific cause at time t
-                            if t > 0:
-                                cause_prob = cause_hazards[i, cause, t] * overall_survival[i, t-1]
-                            else:
-                                cause_prob = cause_hazards[i, cause, t]
-                                
-                            nll[i] = -torch.log(cause_prob + 1e-7)
-                        else:  # Censored
-                            # Add log probability of survival up to censoring time
-                            nll[i] = -torch.log(overall_survival[i, t] + 1e-7)
-                
-                # Compute mean NLL for valid samples
-                nll = torch.sum(nll * mask) / (valid_samples + 1e-6)
-                loss = nll
-                
-                # Add ranking loss if alpha_rank > 0
-                if self.alpha_rank > 0:
-                    # Compute concordance loss for each cause
-                    rank_loss = torch.tensor(0.0, device=device)
-                    
-                    for cause in range(self.num_risks):
-                        # Extract samples with this cause
-                        cause_mask = (event_cause == cause) & (mask > 0)
-                        
-                        if torch.sum(cause_mask) > 0:
-                            cause_rank_loss = self._compute_ranking_loss(
-                                risk_scores[:, cause], 
-                                cause_mask.float(), 
-                                event_time,
-                                mask
-                            )
-                            rank_loss = rank_loss + cause_rank_loss
-                    
-                    # Average across causes
-                    rank_loss = rank_loss / self.num_risks
-                    loss = loss + self.alpha_rank * rank_loss
-                
-                # Add calibration loss if alpha_calibration > 0
-                if self.alpha_calibration > 0:
-                    calibration_loss = self._compute_calibration_loss(
-                        cif, 
-                        event_indicator, 
-                        event_time, 
-                        event_cause,
-                        mask
-                    )
-                    loss = loss + self.alpha_calibration * calibration_loss
-        
-        return {
-            'loss': loss,
-            'cause_hazards': cause_hazards,
-            'overall_survival': overall_survival,
-            'cif': cif,
-            'risk_scores': risk_scores
-        }
-    
-    def predict(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Generate competing risks predictions.
-        
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input representation [batch_size, input_dim]
-            
-        Returns
-        -------
-        Dict[str, torch.Tensor]
-            Dictionary containing:
-            - 'cause_hazards': Predicted cause-specific hazards [batch_size, num_risks, num_time_bins]
-            - 'overall_survival': Predicted overall survival function [batch_size, num_time_bins]
-            - 'cif': Cumulative incidence functions [batch_size, num_risks, num_time_bins]
-            - 'risk_scores': Cause-specific risk scores [batch_size, num_risks]
-        """
-        # Compute predictions (no loss)
-        outputs = self.forward(x)
-        
-        # Remove loss from outputs
-        outputs.pop('loss', None)
-        
-        return outputs
-    
-    def compute_metrics(self, outputs: Dict[str, torch.Tensor], targets: torch.Tensor) -> Dict[str, float]:
-        """
-        Compute evaluation metrics for competing risks prediction.
-        
-        Parameters
-        ----------
-        outputs : Dict[str, torch.Tensor]
-            Model outputs from the forward pass
-            
-        targets : torch.Tensor
-            Ground truth targets with shape [batch_size, 3 + num_risks * num_time_bins]:
-            - targets[:, 0]: Event indicator (1 if any event occurred, 0 if censored)
-            - targets[:, 1]: Time bin index where event/censoring occurred
-            - targets[:, 2]: Cause index (0 to num_risks-1, or -1 if censored)
-            - targets[:, 3:]: One-hot encoding of event time and cause (for convenience)
-            
-        Returns
-        -------
-        Dict[str, float]
-            Dictionary of metric names and values:
-            - 'cause_specific_c_index_{i}': Cause-specific concordance index for cause i
-            - 'cause_specific_auc_{i}': Time-dependent AUC for cause i
-            - 'overall_c_index': Overall concordance index
-            - 'integrated_brier_score': Integrated Brier score
-        """
-        # Extract predictions and targets
-        risk_scores = outputs['risk_scores'].detach().cpu().numpy()
-        cif = outputs['cif'].detach().cpu().numpy()
-        
-        event_indicator = targets[:, 0].detach().cpu().numpy()
-        event_time = targets[:, 1].detach().cpu().numpy()
-        event_cause = targets[:, 2].detach().cpu().numpy()
-        
-        # Initialize metrics dictionary
-        metrics = {}
-        
-        # Compute cause-specific metrics
-        for i in range(self.num_risks):
-            # Compute cause-specific concordance index
-            cause_c_index = self._compute_cause_specific_c_index(
-                risk_scores[:, i], 
-                event_time, 
-                event_indicator, 
-                event_cause, 
-                i
-            )
-            metrics[f'cause_specific_c_index_{i}'] = cause_c_index
-            
-            # Compute cause-specific AUC
-            cause_auc = self._compute_cause_specific_auc(
-                risk_scores[:, i], 
-                event_time, 
-                event_indicator, 
-                event_cause, 
-                i
-            )
-            metrics[f'cause_specific_auc_{i}'] = cause_auc
-        
-        # Compute overall concordance index
-        metrics['overall_c_index'] = np.mean([metrics[f'cause_specific_c_index_{i}'] for i in range(self.num_risks)])
-        
-        # Compute integrated Brier score
-        metrics['integrated_brier_score'] = self._compute_integrated_brier_score(
-            cif, 
-            event_time, 
-            event_indicator, 
-            event_cause
-        )
-        
-        return metrics
-    
-    def _compute_ranking_loss(self, 
-                             risk_scores: torch.Tensor, 
-                             cause_mask: torch.Tensor, 
-                             event_time: torch.Tensor,
-                             mask: torch.Tensor) -> torch.Tensor:
-        """
-        Compute ranking loss for cause-specific concordance optimization.
-        
-        Parameters
-        ----------
-        risk_scores : torch.Tensor
-            Predicted risk scores for a specific cause [batch_size]
-            
-        cause_mask : torch.Tensor
-            Mask indicating samples with events of this cause [batch_size]
-            
-        event_time : torch.Tensor
-            Event times [batch_size]
-            
-        mask : torch.Tensor
-            Mask indicating valid samples [batch_size]
-            
-        Returns
-        -------
-        torch.Tensor
-            Ranking loss value (scalar)
-        """
-        batch_size = risk_scores.size(0)
-        device = risk_scores.device
-        
-        # Initialize loss
-        loss = torch.tensor(0.0, device=device)
-        
-        # Count valid comparisons
-        valid_comparisons = 0
-        
-        # Compute pairwise rankings
-        for i in range(batch_size):
-            if cause_mask[i] == 0:
-                # Skip samples without this cause for first position
-                continue
-                
-            for j in range(batch_size):
-                if mask[j] == 0:
-                    # Skip masked samples for second position
-                    continue
-                    
-                # Valid comparison if:
-                # 1. i had an event of this cause and j was censored after i's event, or
-                # 2. i had an event of this cause and j had an event of any cause after i's event
-                if (cause_mask[i] == 1 and event_time[j] > event_time[i]):
-                    # i should have a higher risk score than j
-                    risk_diff = risk_scores[j] - risk_scores[i]
-                    
-                    # Compute hinge loss: max(0, 1 - (risk_i - risk_j))
-                    pair_loss = torch.relu(1.0 + risk_diff)
-                    
-                    loss = loss + pair_loss
-                    valid_comparisons += 1
-        
-        # Normalize loss by number of valid comparisons
-        if valid_comparisons > 0:
-            loss = loss / valid_comparisons
-            
-        return loss
-    
-    def _compute_calibration_loss(self,
-                                 cif: torch.Tensor,
-                                 event_indicator: torch.Tensor,
-                                 event_time: torch.Tensor,
-                                 event_cause: torch.Tensor,
-                                 mask: torch.Tensor) -> torch.Tensor:
-        """
-        Compute calibration loss to ensure predicted CIFs match empirical frequencies.
-        
-        Parameters
-        ----------
-        cif : torch.Tensor
-            Predicted cumulative incidence functions [batch_size, num_risks, num_time_bins]
-            
-        event_indicator : torch.Tensor
-            Event indicators [batch_size]
-            
-        event_time : torch.Tensor
-            Event times [batch_size]
-            
-        event_cause : torch.Tensor
-            Event causes [batch_size]
-            
-        mask : torch.Tensor
-            Mask indicating valid samples [batch_size]
-            
-        Returns
-        -------
-        torch.Tensor
-            Calibration loss value (scalar)
-        """
-        batch_size = cif.size(0)
-        device = cif.device
-        
-        # Get number of time bins and risks
-        num_risks = cif.size(1)
-        num_bins = cif.size(2)
-        
-        # Initialize loss
-        loss = torch.tensor(0.0, device=device)
-        
-        # For each cause and time bin, compute expected vs observed event counts
-        for cause in range(num_risks):
-            for t in range(num_bins):
-                # Samples at risk at time t (not having events before t)
-                at_risk = (event_time >= t) & (mask > 0)
-                num_at_risk = torch.sum(at_risk)
-                
-                if num_at_risk > 0:
-                    # Expected number of events of this cause at time t based on predicted CIFs
-                    if t > 0:
-                        expected_events = torch.sum((cif[:, cause, t] - cif[:, cause, t-1])[at_risk])
-                    else:
-                        expected_events = torch.sum(cif[:, cause, t][at_risk])
-                    
-                    # Observed number of events of this cause at time t
-                    observed_events = torch.sum((event_time == t) & (event_cause == cause) & at_risk)
-                    
-                    # Squared difference between expected and observed
-                    bin_loss = (expected_events - observed_events).pow(2) / num_at_risk
-                    loss = loss + bin_loss
-        
-        # Normalize by number of time bins and causes
-        loss = loss / (num_risks * num_bins)
-        
-        return loss
-    
-    def _compute_cause_specific_c_index(self, 
-                                       risk_scores: np.ndarray, 
-                                       event_time: np.ndarray, 
-                                       event_indicator: np.ndarray,
-                                       event_cause: np.ndarray,
-                                       cause: int) -> float:
-        """
-        Compute cause-specific concordance index for competing risks.
-        
-        Parameters
-        ----------
-        risk_scores : np.ndarray
-            Predicted risk scores for a specific cause
-            
-        event_time : np.ndarray
-            Event times
-            
-        event_indicator : np.ndarray
-            Event indicators (1 if event occurred, 0 if censored)
-            
-        event_cause : np.ndarray
-            Event causes (-1 if censored)
-            
-        cause : int
-            The specific cause to evaluate
-            
-        Returns
-        -------
-        float
-            Cause-specific concordance index
-        """
-        # For convenience, using NumPy for this computation
-        n_samples = len(risk_scores)
-        
-        # Initialize counters
-        concordant = 0
-        discordant = 0
-        tied_risk = 0
-        
-        # Count comparable pairs
-        comparable_pairs = 0
-        
-        # Compute pairwise comparisons
-        for i in range(n_samples):
-            # Skip samples without this cause for first position
-            if not (event_indicator[i] == 1 and event_cause[i] == cause):
-                continue
-                
-            for j in range(n_samples):
-                # Valid comparison if:
-                # 1. i had an event of this cause and j was censored after i's event, or
-                # 2. i had an event of this cause and j had an event of any cause after i's event
-                if event_time[j] > event_time[i]:
-                    # i should have a higher risk score than j
-                    if risk_scores[i] > risk_scores[j]:
-                        concordant += 1
-                    elif risk_scores[i] < risk_scores[j]:
-                        discordant += 1
-                    else:
-                        tied_risk += 1
-                    
-                    comparable_pairs += 1
-        
-        # Compute concordance index
-        if comparable_pairs > 0:
-            return (concordant + 0.5 * tied_risk) / comparable_pairs
-        else:
-            return 0.5  # Default value when no comparable pairs exist
-    
-    def _compute_cause_specific_auc(self, 
-                                   risk_scores: np.ndarray, 
-                                   event_time: np.ndarray, 
-                                   event_indicator: np.ndarray,
-                                   event_cause: np.ndarray,
-                                   cause: int) -> float:
-        """
-        Compute cause-specific time-dependent AUC for competing risks.
-        
-        Parameters
-        ----------
-        risk_scores : np.ndarray
-            Predicted risk scores for a specific cause
-            
-        event_time : np.ndarray
-            Event times
-            
-        event_indicator : np.ndarray
-            Event indicators (1 if event occurred, 0 if censored)
-            
-        event_cause : np.ndarray
-            Event causes (-1 if censored)
-            
-        cause : int
-            The specific cause to evaluate
-            
-        Returns
-        -------
-        float
-            Cause-specific time-dependent AUC
-        """
-        # Find unique event times for this cause
-        cause_events = (event_indicator == 1) & (event_cause == cause)
-        unique_times = np.unique(event_time[cause_events])
-        
-        if len(unique_times) == 0:
-            return 0.5  # Default value when no events of this cause
-        
-        # Initialize AUCs for each time point
-        aucs = np.zeros(len(unique_times))
-        
-        # Compute AUC at each time point
-        for i, t in enumerate(unique_times):
-            # Positive class: samples with events of this cause at time t
-            positives = (event_time == t) & (event_indicator == 1) & (event_cause == cause)
-            
-            # Negative class: samples alive after time t
-            negatives = event_time > t
-            
-            # Skip if no positives or negatives
-            if np.sum(positives) == 0 or np.sum(negatives) == 0:
-                aucs[i] = 0.5
-                continue
-            
-            # Extract risk scores for positives and negatives
-            pos_scores = risk_scores[positives]
-            neg_scores = risk_scores[negatives]
-            
-            # Compute AUC by comparing all pairs
-            n_pos = len(pos_scores)
-            n_neg = len(neg_scores)
-            
-            # Count concordant pairs
-            concordant = 0
-            
-            for pos_score in pos_scores:
-                concordant += np.sum(pos_score > neg_scores)
-                concordant += 0.5 * np.sum(pos_score == neg_scores)
-            
-            # Compute AUC
-            aucs[i] = concordant / (n_pos * n_neg)
-        
-        # Return mean AUC across all time points
-        return np.mean(aucs)
-    
-    def _compute_integrated_brier_score(self, 
-                                       cif: np.ndarray, 
-                                       event_time: np.ndarray, 
-                                       event_indicator: np.ndarray,
-                                       event_cause: np.ndarray) -> float:
-        """
-        Compute integrated Brier score for competing risks predictions.
-        
-        Parameters
-        ----------
-        cif : np.ndarray
-            Predicted cumulative incidence functions [batch_size, num_risks, num_time_bins]
-            
-        event_time : np.ndarray
-            Event times
-            
-        event_indicator : np.ndarray
-            Event indicators (1 if event occurred, 0 if censored)
-            
-        event_cause : np.ndarray
-            Event causes (-1 if censored)
-            
-        Returns
-        -------
-        float
-            Integrated Brier score
-        """
-        # Number of time bins and risks
-        num_risks = cif.shape[1]
-        num_bins = cif.shape[2]
-        
-        # Initialize Brier scores
-        brier_scores = np.zeros((num_risks, num_bins))
-        
-        # Compute Brier score for each cause and time point
-        for cause in range(num_risks):
-            for t in range(num_bins):
-                # True status for this cause at time t
-                # 1 if event of this cause by time t, 0 otherwise
-                true_status = (event_indicator == 1) & (event_cause == cause) & (event_time <= t)
-                
-                # Mask for samples that we can evaluate
-                # (either had an event by time t or were still being followed at time t)
-                mask = (event_indicator == 1) & (event_time <= t) | (event_time > t)
-                
-                if np.sum(mask) > 0:
-                    # Compute squared error between predicted and true
-                    pred_cif = cif[:, cause, t]
-                    squared_error = ((pred_cif - true_status.astype(float)) ** 2)[mask]
-                    brier_scores[cause, t] = np.mean(squared_error)
-        
-        # Compute mean Brier score across all time points and causes
-        return np.mean(brier_scores)
-    
-    def get_config(self) -> Dict[str, Any]:
-        """
-        Get configuration dictionary for serialization.
-        
-        Returns
-        -------
-        Dict[str, Any]
-            Configuration dictionary
-        """
-        config = super().get_config()
-        config.update({
-            'num_time_bins': self.num_time_bins,
-            'num_risks': self.num_risks,
-            'alpha_rank': self.alpha_rank,
-            'alpha_calibration': self.alpha_calibration,
-            'use_softmax': self.use_softmax,
-            'use_cause_specific': self.use_cause_specific
         })
         return config

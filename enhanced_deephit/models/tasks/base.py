@@ -38,7 +38,7 @@ class TaskHead(nn.Module, ABC):
         self.task_weight = task_weight
         
     @abstractmethod
-    def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None, sample_weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the task head.
         
@@ -52,6 +52,9 @@ class TaskHead(nn.Module, ABC):
             
         mask : torch.Tensor, optional
             Mask indicating which samples have targets for this task
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -172,7 +175,8 @@ class MultiTaskManager(nn.Module):
     def forward(self, 
                x: torch.Tensor, 
                targets: Dict[str, torch.Tensor],
-               masks: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, Any]:
+               masks: Optional[Dict[str, torch.Tensor]] = None,
+               sample_weights: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
         Forward pass through all task heads.
         
@@ -187,6 +191,9 @@ class MultiTaskManager(nn.Module):
         masks : Dict[str, torch.Tensor], optional
             Dictionary mapping task names to mask tensors
             (1 for samples with targets, 0 for samples without)
+            
+        sample_weights : torch.Tensor, optional
+            Sample weights for weighted loss calculation [batch_size]
             
         Returns
         -------
@@ -237,7 +244,7 @@ class MultiTaskManager(nn.Module):
                 continue
                 
             # Forward pass through task head
-            outputs = task_head(x, task_target, task_mask)
+            outputs = task_head(x, task_target, task_mask, sample_weights)
             
             # Extract and scale task loss
             task_loss = outputs.get('loss', torch.tensor(0.0, device=device))
