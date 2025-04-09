@@ -1,0 +1,12 @@
+[flake8]
+max-line-length = 100
+exclude = .git,__pycache__,build,dist,*.egg-info,venv,ENV,.env,.venv,docs/conf.py
+ignore = E203,W503,W504
+per-file-ignores =
+    # Allow importing but unused in __init__.py files
+    **/__init__.py: F401
+    # Allow long lines and unused imports in tests
+    tests/*.py: E501,F401
+    */tests/*.py: E501,F401
+    # Ignore sympy-related issues in loss verification
+    */loss_verification/*.py: F401,F821,F841

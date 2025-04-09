@@ -177,7 +177,18 @@ model_outputs/
 
 # Generated files
 plots/
+!plots/README.md
 example_outputs/
+!example_outputs/README.md
+model_outputs/
+!model_outputs/README.md
+
+# Keep some image and data files in specific directories
+!vignettes/plots/README.md
+!vignettes/html/README.md
+!vignettes/ebmt3.csv
+
+# Generated media files
 *.png
 *.jpg
 *.jpeg
@@ -189,12 +200,15 @@ example_outputs/
 *.mp4
 *.avi
 *.mov
+
+# Generated data files
 *.html
 *.csv
 *.tsv
 *.xlsx
 *.json
 *.xml
+*.bak
 
 # Temporary files
 temp/
