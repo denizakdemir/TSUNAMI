@@ -221,7 +221,8 @@ def calculate_and_plot_importance_scores(model, X_tensor, target_tensor, feature
         n_repeats=3,
         feature_names=feature_names,
         cat_feature_info=cat_feature_info,
-        use_original_names=True
+        use_original_names=True,
+        pool_embeddings=True
     )
     
     # With sample weights (if provided)
@@ -235,7 +236,8 @@ def calculate_and_plot_importance_scores(model, X_tensor, target_tensor, feature
             feature_names=feature_names,
             cat_feature_info=cat_feature_info,
             use_original_names=True,
-            sample_weights=weights_tensor
+            sample_weights=weights_tensor,
+            pool_embeddings=True
         )
     
     # Plot permutation importance
@@ -271,7 +273,8 @@ def calculate_and_plot_importance_scores(model, X_tensor, target_tensor, feature
     shap_values = shap_imp.compute_importance(
         inputs_subset,
         n_samples=20,  # Reduced for speed
-        feature_names=feature_names
+        feature_names=feature_names,
+        pool_embeddings=True
     )
     
     # Plot SHAP importance
@@ -334,7 +337,8 @@ def calculate_and_plot_importance_scores(model, X_tensor, target_tensor, feature
         single_sample,
         target_class='risk_score',
         feature_names=feature_names,
-        n_steps=20  # Reduced for speed
+        n_steps=20,  # Reduced for speed
+        pool_embeddings=True
     )
     
     # Plot integrated gradients
@@ -357,7 +361,8 @@ def calculate_and_plot_importance_scores(model, X_tensor, target_tensor, feature
     attention_scores = attn_imp.compute_importance(
         small_batch,
         feature_names=feature_names,
-        layer_idx=-1  # Use the last transformer layer
+        layer_idx=-1,  # Use the last transformer layer
+        pool_embeddings=True
     )
     
     # Plot attention importance
