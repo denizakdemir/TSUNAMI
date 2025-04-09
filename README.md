@@ -25,7 +25,7 @@ TSUNAMI is a comprehensive tabular transformer architecture for advanced surviva
 Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/TSUNAMI.git
+git clone https://github.com/denizakdemir/TSUNAMI.git
 cd TSUNAMI
 ```
 
@@ -34,7 +34,7 @@ Create a virtual environment and install dependencies:
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 ## Usage
@@ -101,23 +101,31 @@ predictions = model.predict(test_continuous, categorical=test_categorical)
 ```
 
 See the examples directory for more detailed usage examples:
-- `single_risk_example.py`: Single-risk survival analysis
-- `competing_risks_example.py`: Competing risks survival analysis
-- `multi_task_example.py`: Multi-task learning with survival, classification, and regression
+- `enhanced_deephit/examples/single_risk_example.py`: Single-risk survival analysis
+- `enhanced_deephit/examples/competing_risks_example.py`: Competing risks survival analysis
+- `enhanced_deephit/examples/multi_task_example.py`: Multi-task learning with survival, classification, and regression
+- `enhanced_deephit/examples/importance/feature_importance_example.py`: Feature importance calculation
+- `enhanced_deephit/examples/visualization/survival_visualization_example.py`: Visualization tools
 
 ## Project Structure
 
 ```
 enhanced_deephit/
+├── checkpoints/        # Model checkpoint storage
 ├── data/               # Data processing utilities
 ├── examples/           # Example usage scripts
+│   ├── importance/     # Feature importance examples
+│   └── visualization/  # Visualization examples
 ├── models/             # Model architecture components
 │   └── tasks/          # Task-specific heads
 ├── simulation/         # Synthetic data generation
 ├── tests/              # Unit tests
+│   └── utils/          # Test utilities
 └── visualization/      # Visualization utilities
     └── importance/     # Feature importance tools
 ```
+
+For more details about the project structure, see [STRUCTURE.md](STRUCTURE.md).
 
 ## Architecture
 
@@ -134,7 +142,9 @@ TSUNAMI consists of several core components:
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit a Pull Request. 
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines on how to contribute to this project.
 
 ## License
 
@@ -151,7 +161,7 @@ If you use TSUNAMI in your research, please cite:
   year = {2023},
   publisher = {GitHub},
   journal = {GitHub repository},
-  howpublished = {\url{https://github.com/yourusername/TSUNAMI}}
+  howpublished = {\url{https://github.com/denizakdemir/TSUNAMI}}
 }
 ```
 
