@@ -48,7 +48,8 @@ class PermutationImportance:
         task_name: Optional[str] = None,
         cat_feature_info: Optional[List[Dict]] = None,
         use_original_names: bool = True,
-        sample_weights: Optional[torch.Tensor] = None
+        sample_weights: Optional[torch.Tensor] = None,
+        pool_embeddings: bool = True
     ) -> Dict[str, float]:
         """
         Compute permutation importance scores.
@@ -81,6 +82,9 @@ class PermutationImportance:
             
         sample_weights : torch.Tensor, optional
             Sample weights for weighted importance calculations [n_samples]
+            
+        pool_embeddings : bool, default=True
+            Whether to pool importance scores for embedding dimensions of the same feature
             
         Returns
         -------
@@ -302,6 +306,10 @@ class PermutationImportance:
         else:
             normalized_scores = raw_importance_scores.copy()
         
+        # Pool embedding dimensions if requested and we don't have cat_feature_info
+        if pool_embeddings and not cat_feature_info:
+            normalized_scores = self._pool_embedding_importance(normalized_scores)
+            
         # Filter to return only one importance score per feature/category
         final_scores = {}
         processed_names = set()
@@ -322,6 +330,53 @@ class PermutationImportance:
             processed_names.add(name)
         
         return final_scores
+        
+    def _pool_embedding_importance(self, importance_dict: Dict[str, float]) -> Dict[str, float]:
+        """
+        Pool importance scores for embedding dimensions of the same feature.
+        
+        Parameters
+        ----------
+        importance_dict : Dict[str, float]
+            Dictionary mapping feature names to importance scores
+            
+        Returns
+        -------
+        Dict[str, float]
+            Dictionary with pooled importance scores where embedding dimensions
+            are combined into a single score per feature
+        """
+        # Create a new dictionary to store pooled scores
+        pooled_dict = {}
+        
+        # Track features that we've already processed
+        processed_features = set()
+        
+        # First, identify embedding features by looking for "_embed_" in the name
+        for name, value in importance_dict.items():
+            if "_embed_" in name:
+                # Extract the base feature name (before the _embed_ suffix)
+                base_feature = name.split("_embed_")[0]
+                
+                # Skip if we've already processed this base feature
+                if base_feature in processed_features:
+                    continue
+                
+                # Find all embedding dimensions for this feature
+                embed_values = []
+                for embed_name, embed_value in importance_dict.items():
+                    if embed_name.startswith(f"{base_feature}_embed_"):
+                        embed_values.append(embed_value)
+                
+                # Pool the values (use sum as default pooling strategy)
+                if embed_values:
+                    pooled_dict[base_feature] = sum(embed_values)
+                    processed_features.add(base_feature)
+            elif name not in processed_features and "_embed_" not in name:
+                # For non-embedding features, just copy the value
+                pooled_dict[name] = value
+        
+        return pooled_dict
     
     def plot_importance(
         self,
@@ -491,7 +546,8 @@ class ShapImportance:
         background_samples: Optional[torch.Tensor] = None,
         feature_names: Optional[List[str]] = None,
         task_name: Optional[str] = None,
-        target_output: str = 'risk_score'
+        target_output: str = 'risk_score',
+        pool_embeddings: bool = True
     ) -> Dict[str, np.ndarray]:
         """
         Compute SHAP values for feature importance.
@@ -515,6 +571,9 @@ class ShapImportance:
             
         target_output : str, default='risk_score'
             Target output to explain ('risk_score', 'survival', 'hazard')
+            
+        pool_embeddings : bool, default=True
+            Whether to pool importance scores for embedding dimensions of the same feature
             
         Returns
         -------
@@ -630,7 +689,69 @@ class ShapImportance:
         # Create dictionary mapping feature names to SHAP values
         shap_dict = {name: shap_values[:, i] for i, name in enumerate(feature_names)}
         
+        # Pool embedding dimensions if requested
+        if pool_embeddings:
+            shap_dict = self._pool_embedding_importance(shap_dict)
+        
         return shap_dict
+        
+    def _pool_embedding_importance(self, importance_dict: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Pool importance scores for embedding dimensions of the same feature.
+        
+        Parameters
+        ----------
+        importance_dict : Dict[str, np.ndarray]
+            Dictionary mapping feature names to importance arrays
+            
+        Returns
+        -------
+        Dict[str, np.ndarray]
+            Dictionary with pooled importance scores where embedding dimensions
+            are combined into a single score per feature
+        """
+        # Create a new dictionary to store pooled scores
+        pooled_dict = {}
+        
+        # Track features that we've already processed
+        processed_features = set()
+        
+        # First, identify embedding features by looking for "_embed_" in the name
+        for name, values in importance_dict.items():
+            if "_embed_" in name:
+                # Extract the base feature name (before the _embed_ suffix)
+                base_feature = name.split("_embed_")[0]
+                
+                # Skip if we've already processed this base feature
+                if base_feature in processed_features:
+                    continue
+                
+                # Find all embedding dimensions for this feature
+                embed_values = []
+                embed_names = []
+                for embed_name, embed_value in importance_dict.items():
+                    if embed_name.startswith(f"{base_feature}_embed_"):
+                        embed_values.append(embed_value)
+                        embed_names.append(embed_name)
+                
+                # Pool the values by summing across embedding dimensions
+                if embed_values:
+                    # Sum arrays element-wise
+                    pooled_values = np.zeros_like(embed_values[0])
+                    for v in embed_values:
+                        pooled_values += v
+                    
+                    pooled_dict[base_feature] = pooled_values
+                    processed_features.add(base_feature)
+                    
+                    # Add the names to processed to avoid duplicates
+                    for embed_name in embed_names:
+                        processed_features.add(embed_name)
+            elif name not in processed_features:
+                # For non-embedding features, just copy the values
+                pooled_dict[name] = importance_dict[name]
+        
+        return pooled_dict
     
     def plot_importance(
         self,
@@ -762,7 +883,8 @@ class IntegratedGradients:
         baseline: Optional[torch.Tensor] = None,
         feature_names: Optional[List[str]] = None,
         task_name: Optional[str] = None,
-        n_steps: int = 50
+        n_steps: int = 50,
+        pool_embeddings: bool = True
     ) -> Dict[str, float]:
         """
         Compute feature importance using integrated gradients.
@@ -787,6 +909,9 @@ class IntegratedGradients:
             
         n_steps : int, default=50
             Number of steps for numerical integration
+            
+        pool_embeddings : bool, default=True
+            Whether to pool importance scores for embedding dimensions of the same feature
             
         Returns
         -------
@@ -905,6 +1030,10 @@ class IntegratedGradients:
             # Sizes match
             importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
         
+        # Pool embedding dimensions if requested
+        if pool_embeddings:
+            importance_dict = self._pool_embedding_importance(importance_dict)
+        
         # Normalize importance values
         max_importance = max(importance_dict.values())
         if max_importance > 0:
@@ -912,6 +1041,53 @@ class IntegratedGradients:
                 importance_dict[name] /= max_importance
         
         return importance_dict
+        
+    def _pool_embedding_importance(self, importance_dict: Dict[str, float]) -> Dict[str, float]:
+        """
+        Pool importance scores for embedding dimensions of the same feature.
+        
+        Parameters
+        ----------
+        importance_dict : Dict[str, float]
+            Dictionary mapping feature names to importance values
+            
+        Returns
+        -------
+        Dict[str, float]
+            Dictionary with pooled importance scores where embedding dimensions
+            are combined into a single score per feature
+        """
+        # Create a new dictionary to store pooled scores
+        pooled_dict = {}
+        
+        # Track features that we've already processed
+        processed_features = set()
+        
+        # First, identify embedding features by looking for "_embed_" in the name
+        for name, value in importance_dict.items():
+            if "_embed_" in name:
+                # Extract the base feature name (before the _embed_ suffix)
+                base_feature = name.split("_embed_")[0]
+                
+                # Skip if we've already processed this base feature
+                if base_feature in processed_features:
+                    continue
+                
+                # Find all embedding dimensions for this feature
+                embed_values = []
+                for embed_name, embed_value in importance_dict.items():
+                    if embed_name.startswith(f"{base_feature}_embed_"):
+                        embed_values.append(embed_value)
+                
+                # Pool the values (use sum as default pooling strategy)
+                if embed_values:
+                    pooled_dict[base_feature] = sum(embed_values)
+                    processed_features.add(base_feature)
+            elif name not in processed_features and "_embed_" not in name:
+                # For non-embedding features, just copy the value
+                pooled_dict[name] = value
+        
+        return pooled_dict
     
     def plot_importance(
         self,
@@ -1004,7 +1180,8 @@ class AttentionImportance:
         feature_names: Optional[List[str]] = None,
         layer_idx: int = -1,
         head_idx: Optional[int] = None,
-        aggregation: str = 'mean'
+        aggregation: str = 'mean',
+        pool_embeddings: bool = True
     ) -> Dict[str, float]:
         """
         Compute feature importance from attention weights.
@@ -1025,6 +1202,9 @@ class AttentionImportance:
             
         aggregation : str, default='mean'
             Method to aggregate attention weights ('mean', 'max', 'sum')
+            
+        pool_embeddings : bool, default=True
+            Whether to pool importance scores for embedding dimensions of the same feature
             
         Returns
         -------
@@ -1103,6 +1283,10 @@ class AttentionImportance:
             # Sizes match
             importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
         
+        # Pool embedding dimensions if requested
+        if pool_embeddings:
+            importance_dict = self._pool_embedding_importance(importance_dict)
+        
         # Normalize importance values
         total_importance = sum(importance_dict.values())
         if total_importance > 0:
@@ -1110,6 +1294,53 @@ class AttentionImportance:
                 importance_dict[name] /= total_importance
         
         return importance_dict
+        
+    def _pool_embedding_importance(self, importance_dict: Dict[str, float]) -> Dict[str, float]:
+        """
+        Pool importance scores for embedding dimensions of the same feature.
+        
+        Parameters
+        ----------
+        importance_dict : Dict[str, float]
+            Dictionary mapping feature names to importance scores
+            
+        Returns
+        -------
+        Dict[str, float]
+            Dictionary with pooled importance scores where embedding dimensions
+            are combined into a single score per feature
+        """
+        # Create a new dictionary to store pooled scores
+        pooled_dict = {}
+        
+        # Track features that we've already processed
+        processed_features = set()
+        
+        # First, identify embedding features by looking for "_embed_" in the name
+        for name, value in importance_dict.items():
+            if "_embed_" in name:
+                # Extract the base feature name (before the _embed_ suffix)
+                base_feature = name.split("_embed_")[0]
+                
+                # Skip if we've already processed this base feature
+                if base_feature in processed_features:
+                    continue
+                
+                # Find all embedding dimensions for this feature
+                embed_values = []
+                for embed_name, embed_value in importance_dict.items():
+                    if embed_name.startswith(f"{base_feature}_embed_"):
+                        embed_values.append(embed_value)
+                
+                # Pool the values (use sum as default pooling strategy)
+                if embed_values:
+                    pooled_dict[base_feature] = sum(embed_values)
+                    processed_features.add(base_feature)
+            elif name not in processed_features and "_embed_" not in name:
+                # For non-embedding features, just copy the value
+                pooled_dict[name] = value
+        
+        return pooled_dict
     
     def get_attention_map(
         self,
