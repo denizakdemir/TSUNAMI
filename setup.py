@@ -9,7 +9,7 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setup(
-    name="enhanced_deephit",
+    name="tsunami",
     version="0.1.0",
     author="Deniz Akdemir",
     author_email="denizakdemir@example.com",
@@ -30,5 +30,5 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=requirements,
-    test_suite="enhanced_deephit.tests",
+    test_suite="source.tests",
 )

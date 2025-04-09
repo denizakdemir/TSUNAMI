@@ -43,10 +43,10 @@ Here's a basic example of using TSUNAMI for survival analysis:
 
 ```python
 import torch
-from enhanced_deephit.data.processing import DataProcessor
-from enhanced_deephit.models import EnhancedDeepHit
-from enhanced_deephit.models.tasks.survival import SingleRiskHead, CompetingRisksHead
-from enhanced_deephit.simulation.data_generation import generate_survival_data
+from source.data.processing import DataProcessor
+from source.models import EnhancedDeepHit
+from source.models.tasks.survival import SingleRiskHead, CompetingRisksHead
+from source.simulation.data_generation import generate_survival_data
 
 # Generate synthetic data for demonstration
 data, target, num_bins = generate_survival_data(
@@ -101,16 +101,16 @@ predictions = model.predict(test_continuous, categorical=test_categorical)
 ```
 
 See the examples directory for more detailed usage examples:
-- `enhanced_deephit/examples/single_risk_example.py`: Single-risk survival analysis
-- `enhanced_deephit/examples/competing_risks_example.py`: Competing risks survival analysis
-- `enhanced_deephit/examples/multi_task_example.py`: Multi-task learning with survival, classification, and regression
-- `enhanced_deephit/examples/importance/feature_importance_example.py`: Feature importance calculation
-- `enhanced_deephit/examples/visualization/survival_visualization_example.py`: Visualization tools
+- `source/examples/single_risk_example.py`: Single-risk survival analysis
+- `source/examples/competing_risks_example.py`: Competing risks survival analysis
+- `source/examples/multi_task_example.py`: Multi-task learning with survival, classification, and regression
+- `source/examples/importance/feature_importance_example.py`: Feature importance calculation
+- `source/examples/visualization/survival_visualization_example.py`: Visualization tools
 
 ## Project Structure
 
 ```
-enhanced_deephit/
+source/
 ├── checkpoints/        # Model checkpoint storage
 ├── data/               # Data processing utilities
 ├── examples/           # Example usage scripts

@@ -5,7 +5,7 @@ This document outlines the organization of the TSUNAMI project codebase.
 ## Directory Structure
 
 ```
-enhanced_deephit/
+source/
 ├── __init__.py             # Package initialization
 ├── data/                   # Data processing modules
 │   ├── __init__.py

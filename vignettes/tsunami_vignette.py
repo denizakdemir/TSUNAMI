@@ -16,23 +16,23 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
 
 # Import TSUNAMI modules
-from enhanced_deephit.data.processing import DataProcessor
-from enhanced_deephit.models import EnhancedDeepHit
-from enhanced_deephit.models.tasks.base import TaskHead
-from enhanced_deephit.models.tasks.standard import ClassificationHead, RegressionHead
-from enhanced_deephit.models.tasks.survival import SingleRiskHead
-from enhanced_deephit.visualization.importance.importance import (
+from source.data.processing import DataProcessor
+from source.models import EnhancedDeepHit
+from source.models.tasks.base import TaskHead
+from source.models.tasks.standard import ClassificationHead, RegressionHead
+from source.models.tasks.survival import SingleRiskHead
+from source.visualization.importance.importance import (
     PermutationImportance,
     ShapImportance,
     IntegratedGradients,
     AttentionImportance
 )
-from enhanced_deephit.visualization.survival_plots import (
+from source.visualization.survival_plots import (
     plot_survival_curve,
     plot_cumulative_incidence,
     plot_calibration_curve
 )
-from enhanced_deephit.visualization.feature_effects import (
+from source.visualization.feature_effects import (
     plot_partial_dependence,
     plot_ice_curves,
     plot_feature_interaction
