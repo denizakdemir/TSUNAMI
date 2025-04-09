@@ -646,9 +646,9 @@ class EnhancedDeepHit(nn.Module):
         
         return total_loss, task_metrics
     
-    def save(self, path: str, save_processor: bool = True, processor: Optional[DataProcessor] = None):
+    def save(self, path: str, save_processor: bool = True, processor: Optional[DataProcessor] = None, metadata: dict = None):
         """
-        Save the model to disk.
+        Save the model to disk with versioning and metadata.
         
         Parameters
         ----------
@@ -660,18 +660,64 @@ class EnhancedDeepHit(nn.Module):
             
         processor : DataProcessor, optional
             Data processor to save
+            
+        metadata : dict, optional
+            Additional metadata to store with the model
         """
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(path), exist_ok=True)
         
-        # Save model parameters
+        # Generate version identifier based on timestamp
+        import time
+        version = int(time.time())
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Prepare comprehensive metadata
+        full_metadata = {
+            "version": version,
+            "timestamp": timestamp,
+            "architecture": {
+                "num_continuous": self.num_continuous,
+                "encoder_dim": self.encoder_dim,
+                "encoder_depth": self.encoder.depth,
+                "encoder_heads": self.encoder.heads,
+                "encoder_ff_dim": getattr(self.encoder, 'ff_dim', 512),
+                "encoder_dropout": getattr(self.encoder, 'attn_dropout', 0.1),
+                "include_variational": self.include_variational,
+                "variational_beta": getattr(self.task_manager, 'variational_beta', 0.1),
+            },
+            "task_config": [task.get_config() for task in self.task_manager.task_heads],
+            "user_metadata": metadata or {}
+        }
+        
+        # Save model parameters with versioning
+        versioned_path = f"{path}_v{version}"
+        torch.save({
+            "state_dict": self.state_dict(),
+            "metadata": full_metadata
+        }, f"{versioned_path}.pt")
+        
+        # Save model configuration with versioning
+        with open(f"{versioned_path}.json", 'w') as f:
+            json.dump(full_metadata, f, indent=2)
+        
+        # Save reference to latest version
+        with open(f"{path}_latest.txt", "w") as f:
+            f.write(str(version))
+        
+        # Additionally save as the base filename for backwards compatibility
         torch.save(self.state_dict(), f"{path}.pt")
         
-        # Save model configuration
+        # Save config as before (for backwards compatibility)
         config = {
             'num_continuous': self.num_continuous,
             'encoder_dim': self.encoder_dim,
+            'encoder_depth': self.encoder.depth,
+            'encoder_heads': self.encoder.heads,
+            'encoder_ff_dim': getattr(self.encoder, 'ff_dim', 512),
+            'encoder_dropout': getattr(self.encoder, 'attn_dropout', 0.1),
             'include_variational': self.include_variational,
+            'variational_beta': getattr(self.task_manager, 'variational_beta', 0.1),
             'cat_feat_info': self.cat_feat_info,
             'task_config': [task.get_config() for task in self.task_manager.task_heads]
         }
@@ -682,11 +728,19 @@ class EnhancedDeepHit(nn.Module):
         # Save data processor if provided
         if save_processor and processor is not None:
             import pickle
+            processor_path = f"{versioned_path}_processor.pkl"
+            with open(processor_path, 'wb') as f:
+                pickle.dump(processor, f)
+            
+            # Also save at the original path for backwards compatibility
             with open(f"{path}_processor.pkl", 'wb') as f:
                 pickle.dump(processor, f)
+        
+        logging.info(f"Model saved with version {version} at {timestamp}")
+        return version
     
     @classmethod
-    def load(cls, path: str, device: str = 'cpu', load_processor: bool = True) -> Tuple['EnhancedDeepHit', Optional[DataProcessor]]:
+    def load(cls, path: str, device: str = 'cpu', load_processor: bool = True, version: str = 'latest') -> Tuple['EnhancedDeepHit', Optional[DataProcessor]]:
         """
         Load a model from disk.
         
@@ -701,16 +755,78 @@ class EnhancedDeepHit(nn.Module):
         load_processor : bool, default=True
             Whether to load the data processor
             
+        version : str, default='latest'
+            Version to load. Can be:
+            - 'latest': Load the most recent version
+            - Specific version number as string: Load that specific version
+            - None: Load using the legacy format (no versioning)
+            
         Returns
         -------
         Tuple[EnhancedDeepHit, Optional[DataProcessor]]
             Tuple containing:
             - Loaded model
             - Data processor (if available)
+            - Metadata dictionary (if available in versioned model)
         """
+        model_path = path
+        processor_path = f"{path}_processor.pkl"
+        config_path = f"{path}.json"
+        metadata = None
+        
+        # Handle versioned models
+        if version is not None:
+            if version == 'latest':
+                # Try to read the latest version number
+                latest_path = f"{path}_latest.txt"
+                if os.path.exists(latest_path):
+                    with open(latest_path, 'r') as f:
+                        version = f.read().strip()
+                        logging.info(f"Loading latest model version: {version}")
+                        model_path = f"{path}_v{version}"
+                        processor_path = f"{model_path}_processor.pkl"
+                        config_path = f"{model_path}.json"
+            else:
+                # Use the specified version
+                model_path = f"{path}_v{version}" 
+                processor_path = f"{model_path}_processor.pkl"
+                config_path = f"{model_path}.json"
+        
+        # Check if we're loading a versioned model with metadata
+        if os.path.exists(f"{model_path}.pt"):
+            try:
+                # Try to load as a versioned model first
+                saved_data = torch.load(f"{model_path}.pt", map_location=device)
+                if isinstance(saved_data, dict) and "state_dict" in saved_data:
+                    state_dict = saved_data["state_dict"]
+                    metadata = saved_data.get("metadata", None)
+                    
+                    if metadata:
+                        logging.info(f"Loaded model with version {metadata.get('version')} from {metadata.get('timestamp')}")
+                else:
+                    # Fall back to legacy format
+                    state_dict = saved_data
+            except Exception as e:
+                # Fall back to legacy format
+                logging.warning(f"Error loading versioned model, trying legacy format: {str(e)}")
+                state_dict = torch.load(f"{path}.pt", map_location=device)
+        else:
+            # Use legacy path
+            state_dict = torch.load(f"{path}.pt", map_location=device)
+            config_path = f"{path}.json"
+            processor_path = f"{path}_processor.pkl"
+        
         # Load model configuration
-        with open(f"{path}.json", 'r') as f:
+        with open(config_path, 'r') as f:
             config = json.load(f)
+        
+        # Extract configuration from metadata if available, otherwise use legacy config
+        if metadata and "architecture" in metadata:
+            arch_config = metadata["architecture"]
+            task_config = metadata["task_config"]
+        else:
+            arch_config = config
+            task_config = config.get('task_config', [])
         
         # Load task configurations
         from enhanced_deephit.models.tasks.survival import SingleRiskHead, CompetingRisksHead
@@ -738,22 +854,22 @@ class EnhancedDeepHit(nn.Module):
         
         # Instantiate model
         model = cls(
-            num_continuous=config['num_continuous'],
+            num_continuous=arch_config['num_continuous'],
             targets=tasks,
             cat_feat_info=config.get('cat_feat_info'),
-            encoder_dim=config['encoder_dim'],
-            include_variational=config.get('include_variational', False),
+            encoder_dim=arch_config['encoder_dim'],
+            include_variational=arch_config.get('include_variational', False),
             device=device
         )
         
         # Load model parameters
-        model.load_state_dict(torch.load(f"{path}.pt", map_location=device))
+        model.load_state_dict(state_dict)
         
         # Load data processor if requested
         processor = None
-        if load_processor and os.path.exists(f"{path}_processor.pkl"):
+        if load_processor and os.path.exists(processor_path):
             import pickle
-            with open(f"{path}_processor.pkl", 'rb') as f:
+            with open(processor_path, 'rb') as f:
                 processor = pickle.load(f)
         
-        return model, processor
+        return model, processor, metadata if metadata else None

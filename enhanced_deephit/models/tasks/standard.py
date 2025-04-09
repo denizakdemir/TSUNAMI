@@ -60,6 +60,68 @@ class ClassificationHead(TaskHead):
             nn.Linear(input_dim * 2, output_dim)
         )
         
+    def loss(self, outputs: Dict[str, torch.Tensor], targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss between model outputs and targets.
+        
+        Parameters
+        ----------
+        outputs : Dict[str, torch.Tensor]
+            Outputs from the forward pass
+            
+        targets : torch.Tensor
+            Target class labels
+            
+        Returns
+        -------
+        torch.Tensor
+            Loss value
+        """
+        # If loss was pre-computed in forward pass (or already available)
+        if 'loss' in outputs and outputs['loss'].item() > 0:
+            return outputs['loss']
+        
+        # If loss wasn't precomputed, compute it now
+        if self.num_classes == 2:
+            # Binary classification
+            if 'logits' in outputs:
+                logits = outputs['logits']
+            else:
+                # If logits not available, convert probabilities to logits
+                probs = torch.clamp(outputs['probabilities'], 1e-5, 1-1e-5)
+                logits = torch.log(probs / (1 - probs))
+            
+            # Make sure targets are the right shape for binary classification
+            if targets.dim() > 1:
+                # If targets have shape [batch, 1], squeeze them
+                targets = targets.squeeze(-1)
+                
+            # Binary cross-entropy loss
+            loss_fn = nn.BCEWithLogitsLoss()
+            return loss_fn(logits, targets.float())
+        else:
+            # Multi-class classification
+            if 'logits' in outputs:
+                logits = outputs['logits']
+            else:
+                # If logits not available, use log of probabilities
+                probs = torch.clamp(outputs['probabilities'], 1e-5, 1-1e-5)
+                logits = torch.log(probs)
+            
+            # Convert targets to indices if they are one-hot encoded
+            if targets.dim() > 1 and targets.size(1) == self.num_classes:
+                targets = torch.argmax(targets, dim=1)
+                
+            # Cross-entropy loss
+            if self.class_weights is not None:
+                # Apply class weights
+                class_weights = torch.tensor(self.class_weights, device=logits.device)
+                loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+            else:
+                loss_fn = nn.CrossEntropyLoss()
+                
+            return loss_fn(logits, targets)
+        
     def forward(self, 
                x: torch.Tensor, 
                targets: Optional[torch.Tensor] = None, 
@@ -145,7 +207,8 @@ class ClassificationHead(TaskHead):
             if valid_samples > 0:
                 # Compute loss
                 if self.num_classes == 2:
-                    # Binary cross-entropy loss
+                    # Binary cross-entropy loss (Logits version)
+                    # L = -[y * log(sigmoid(x)) + (1 - y) * log(1 - sigmoid(x))]
                     loss_fn = nn.BCEWithLogitsLoss(reduction='none')
                     loss_values = loss_fn(logits, targets.float())
                     
@@ -160,6 +223,8 @@ class ClassificationHead(TaskHead):
                     else:
                         loss_fn = nn.CrossEntropyLoss(reduction='none')
                     
+                    # Multi-class cross-entropy loss (LogSoftmax + NLLLoss)
+                    # L = -log(softmax(x)_class) = - (x_class - log(sum(exp(x_j))))
                     loss_values = loss_fn(logits, targets)
                     
                     # Apply combined weights and normalize
@@ -382,6 +447,50 @@ class RegressionHead(TaskHead):
                 raise ValueError("Quantiles must be provided for quantile regression")
         else:
             raise ValueError(f"Unsupported loss type: {loss_type}")
+            
+    def loss(self, outputs: Dict[str, torch.Tensor], targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss between model outputs and targets.
+        
+        Parameters
+        ----------
+        outputs : Dict[str, torch.Tensor]
+            Outputs from the forward pass
+            
+        targets : torch.Tensor
+            Target values for regression
+            
+        Returns
+        -------
+        torch.Tensor
+            Loss value
+        """
+        if 'loss' in outputs:
+            return outputs['loss']
+            
+        # If loss wasn't precomputed, compute it now
+        predictions = outputs['predictions']
+        
+        # Ensure predictions match targets dimension
+        if predictions.dim() > 1 and targets.dim() == 1:
+            # If predictions are [batch_size, 1] but targets are [batch_size]
+            predictions = predictions.squeeze(-1)
+        
+        # Handle missing output dimensions
+        if targets.dim() == 1 and predictions.dim() > 1 and predictions.size(1) > 1:
+            targets = targets.unsqueeze(1).expand(-1, predictions.size(1))
+        
+        # Compute loss
+        if self.loss_type == 'quantile':
+            # Quantile regression loss
+            if self.quantiles is not None:
+                if 'quantiles' in outputs:
+                    quantile_preds = outputs['quantiles']
+                    return self._compute_quantile_loss(quantile_preds, targets, torch.ones_like(targets))
+        
+        # Standard loss
+        loss_values = self.loss_fn(predictions, targets)
+        return torch.mean(loss_values)
         
     def forward(self, 
                x: torch.Tensor, 
@@ -397,7 +506,7 @@ class RegressionHead(TaskHead):
             Input representation [batch_size, input_dim]
             
         targets : torch.Tensor, optional
-            Target values [batch_size, output_dim]
+            Target values [batch_size, output_dim] or [batch_size] for single-output regression
             
         mask : torch.Tensor, optional
             Mask indicating which samples have targets for this task
@@ -441,6 +550,11 @@ class RegressionHead(TaskHead):
             if targets.dim() == 1 and self.output_dim > 1:
                 targets = targets.unsqueeze(1).expand(-1, self.output_dim)
             
+            # Ensure predictions match targets dimension
+            if predictions.dim() > 1 and targets.dim() == 1:
+                # If predictions are [batch_size, 1] but targets are [batch_size]
+                predictions = predictions.squeeze(1)
+            
             # Apply mask if provided
             if mask is not None:
                 # Expand mask to match targets if needed
@@ -451,7 +565,13 @@ class RegressionHead(TaskHead):
                 valid_samples = torch.sum(mask)
             else:
                 # All samples are valid
-                valid_samples = float(batch_size * targets.size(1))
+                # Handle the case where targets are 1D
+                if targets.dim() == 1:
+                    valid_samples = float(batch_size)
+                else:
+                    valid_samples = float(batch_size * targets.size(1))
+                
+                # Create a mask with the same shape as targets
                 mask = torch.ones_like(targets, dtype=torch.float, device=device)
             
             # Apply sample weights if provided
@@ -487,7 +607,7 @@ class RegressionHead(TaskHead):
         # Prepare output dictionary
         outputs = {
             'loss': loss,
-            'predictions': predictions,
+            'predictions': predictions.squeeze(-1),  # Ensure predictions are [batch_size]
         }
         
         # Add quantile predictions if applicable
@@ -541,6 +661,9 @@ class RegressionHead(TaskHead):
         torch.Tensor
             Quantile loss value (scalar)
         """
+        # Quantile (Pinball) Loss:
+        # L_q(y, f) = q * max(0, y - f) + (1 - q) * max(0, f - y)
+        # where y is the target, f is the predicted quantile, and q is the quantile level.
         batch_size = targets.size(0)
         device = targets.device
         n_quantiles = len(self.quantiles)
@@ -741,6 +864,55 @@ class CountDataHead(TaskHead):
             nn.Linear(input_dim * 2, n_outputs)
         )
         
+    def loss(self, outputs: Dict[str, torch.Tensor], targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss between model outputs and targets.
+        
+        Parameters
+        ----------
+        outputs : Dict[str, torch.Tensor]
+            Outputs from the forward pass
+            
+        targets : torch.Tensor
+            Target count values
+            
+        Returns
+        -------
+        torch.Tensor
+            Loss value
+        """
+        if 'loss' in outputs:
+            return outputs['loss']
+            
+        # Extract relevant outputs
+        rate = outputs['rate']
+        
+        # Compute negative log-likelihood based on distribution
+        epsilon = 1e-7
+        rate_safe = torch.clamp(rate, epsilon, 1e6)  # Ensure numeric stability
+        
+        if self.distribution == 'poisson':
+            if self.zero_inflated:
+                # Zero-inflated Poisson
+                zero_prob = outputs['zero_prob']
+                return -torch.mean(self._compute_zip_log_likelihood(rate_safe, zero_prob, targets))
+            else:
+                # Standard Poisson
+                return -torch.mean(self._compute_poisson_log_likelihood(rate_safe, targets))
+        else:  # Negative binomial
+            dispersion = outputs['dispersion']
+            dispersion_safe = torch.clamp(dispersion, epsilon, 1e6)
+            
+            if self.zero_inflated:
+                # Zero-inflated negative binomial
+                zero_prob = outputs['zero_prob']
+                return -torch.mean(self._compute_zinb_log_likelihood(
+                    rate_safe, dispersion_safe, zero_prob, targets))
+            else:
+                # Standard negative binomial
+                return -torch.mean(self._compute_nb_log_likelihood(
+                    rate_safe, dispersion_safe, targets))
+        
     def forward(self, 
                x: torch.Tensor, 
                targets: Optional[torch.Tensor] = None, 
@@ -799,7 +971,8 @@ class CountDataHead(TaskHead):
                 results = {
                     'rate': rate,
                     'zero_prob': zero_prob,
-                    'mean': mean
+                    'mean': mean,
+                    'predictions': mean  # Add predictions key for compatibility
                 }
             else:
                 # Standard Poisson
@@ -815,7 +988,8 @@ class CountDataHead(TaskHead):
                 # Results dictionary
                 results = {
                     'rate': rate.squeeze(-1),
-                    'mean': mean.squeeze(-1)
+                    'mean': mean.squeeze(-1),
+                    'predictions': mean.squeeze(-1)  # Add predictions key for compatibility
                 }
         else:  # Negative binomial
             if self.zero_inflated:
@@ -832,7 +1006,8 @@ class CountDataHead(TaskHead):
                     'rate': rate,
                     'dispersion': dispersion,
                     'zero_prob': zero_prob,
-                    'mean': mean
+                    'mean': mean,
+                    'predictions': mean  # Add predictions key for compatibility
                 }
             else:
                 # Standard negative binomial
@@ -850,7 +1025,8 @@ class CountDataHead(TaskHead):
                 results = {
                     'rate': rate.squeeze(-1),
                     'dispersion': dispersion.squeeze(-1),
-                    'mean': mean.squeeze(-1)
+                    'mean': mean.squeeze(-1),
+                    'predictions': mean.squeeze(-1)  # Add predictions key for compatibility
                 }
         
         # Initialize loss
@@ -946,8 +1122,9 @@ class CountDataHead(TaskHead):
         torch.Tensor
             Log-likelihood values [batch_size]
         """
-        # Poisson log-likelihood: y * log(lambda) - lambda - log(y!)
-        # Since log(y!) is constant for fixed y, we omit it
+        # Poisson log-likelihood: log(P(Y=y | lambda)) = y * log(lambda) - lambda - log(y!)
+        # We omit the log(y!) term as it's constant w.r.t. lambda during optimization.
+        # ll = y * log(lambda) - lambda
         log_rate = torch.log(rate + 1e-10)
         ll = targets * log_rate - rate
         
@@ -973,8 +1150,15 @@ class CountDataHead(TaskHead):
         torch.Tensor
             Log-likelihood values [batch_size]
         """
-        # For zero counts, likelihood is a mixture of structural zeros and Poisson zeros
-        # For non-zero counts, likelihood is from the Poisson part
+        # Zero-Inflated Poisson (ZIP) log-likelihood:
+        # log(P(Y=y | lambda, pi)) = 
+        #   I(y=0) * log(pi + (1-pi)*exp(-lambda)) + 
+        #   I(y>0) * log((1-pi) * Poisson(y | lambda))
+        # where pi is zero_prob.
+        # log(P(Y=y | lambda, pi)) = 
+        #   I(y=0) * log(pi + (1-pi)*exp(-lambda)) + 
+        #   I(y>0) * [log(1-pi) + y*log(lambda) - lambda - log(y!)]
+        # We omit log(y!) term.
         
         zeros = (targets == 0)
         
@@ -1013,16 +1197,21 @@ class CountDataHead(TaskHead):
         torch.Tensor
             Log-likelihood values [batch_size]
         """
+        # Negative Binomial (NB) log-likelihood:
+        # Using parameterization with mean mu=rate and dispersion alpha=dispersion (where variance = mu + alpha*mu^2)
+        # P(Y=y | mu, alpha) = Gamma(y + 1/alpha) / (Gamma(y+1) * Gamma(1/alpha)) * (1/(1+alpha*mu))^(1/alpha) * (alpha*mu/(1+alpha*mu))^y
+        # Let r = 1/alpha = 1/dispersion
+        # P(Y=y | mu, r) = Gamma(y + r) / (Gamma(y+1) * Gamma(r)) * (r/(r+mu))^r * (mu/(r+mu))^y
+        # log(P) = lgamma(y+r) - lgamma(y+1) - lgamma(r) + r*log(r) - r*log(r+mu) + y*log(mu) - y*log(r+mu)
+        # log(P) = lgamma(y+r) - lgamma(y+1) - lgamma(r) + r*log(r) + y*log(mu) - (y+r)*log(r+mu)
+        
         # Convert to torch float for calculations
         y = targets.float()
         
-        # Compute log-likelihood using the negative binomial pmf
         # We use the parameterization where dispersion = 1/r (inverse of number of failures)
         r = 1.0 / dispersion
         
-        # Log-likelihood: log(Gamma(y+r)/(Gamma(y+1)*Gamma(r))) + r*log(r/(r+mu)) + y*log(mu/(r+mu))
-        # We use Stirling's approximation for the gammas
-        
+        # Compute log-likelihood using the formula derived above
         log_mu_term = y * torch.log(rate + 1e-10)
         log_r_term = r * torch.log(r + 1e-10)
         log_neg_binomial = torch.lgamma(y + r) - torch.lgamma(y + 1) - torch.lgamma(r) + log_r_term - (y + r) * torch.log(rate + r + 1e-10) + log_mu_term
@@ -1052,8 +1241,15 @@ class CountDataHead(TaskHead):
         torch.Tensor
             Log-likelihood values [batch_size]
         """
-        # For zero counts, likelihood is a mixture of structural zeros and NB zeros
-        # For non-zero counts, likelihood is from the NB part
+        # Zero-Inflated Negative Binomial (ZINB) log-likelihood:
+        # log(P(Y=y | mu, alpha, pi)) = 
+        #   I(y=0) * log(pi + (1-pi)*NB(0 | mu, alpha)) + 
+        #   I(y>0) * log((1-pi) * NB(y | mu, alpha))
+        # where pi is zero_prob, mu is rate, alpha is dispersion.
+        # log(P) = 
+        #   I(y=0) * log(pi + (1-pi)*(r/(r+mu))^r) + 
+        #   I(y>0) * [log(1-pi) + log(NB(y | mu, r))] 
+        # where r = 1/alpha.
         
         zeros = (targets == 0)
         

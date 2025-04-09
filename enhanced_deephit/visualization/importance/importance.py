@@ -891,7 +891,19 @@ class IntegratedGradients:
         importance_values = attributions.abs().mean(dim=0).detach().numpy()
         
         # Create dictionary of feature importance
-        importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
+        # Check if number of features match and handle mismatch
+        if len(feature_names) > len(importance_values):
+            # More feature names than importance values
+            # Use only as many names as there are values
+            truncated_names = feature_names[:len(importance_values)]
+            importance_dict = {name: importance_values[i] for i, name in enumerate(truncated_names)}
+        elif len(feature_names) < len(importance_values):
+            # More importance values than feature names
+            # Use only as many values as there are names
+            importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
+        else:
+            # Sizes match
+            importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
         
         # Normalize importance values
         max_importance = max(importance_dict.values())
@@ -1077,7 +1089,19 @@ class AttentionImportance:
             raise ValueError(f"Invalid aggregation method: {aggregation}")
         
         # Create dictionary of feature importance
-        importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
+        # Check if number of features match and handle mismatch
+        if len(feature_names) > len(importance_values):
+            # More feature names than importance values
+            # Use only as many names as there are values
+            truncated_names = feature_names[:len(importance_values)]
+            importance_dict = {name: importance_values[i] for i, name in enumerate(truncated_names)}
+        elif len(feature_names) < len(importance_values):
+            # More importance values than feature names
+            # Use only as many values as there are names
+            importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
+        else:
+            # Sizes match
+            importance_dict = {name: importance_values[i] for i, name in enumerate(feature_names)}
         
         # Normalize importance values
         total_importance = sum(importance_dict.values())

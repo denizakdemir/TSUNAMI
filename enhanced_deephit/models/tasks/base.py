@@ -160,6 +160,15 @@ class MultiTaskManager(nn.Module):
         # Create a dictionary of task names for easy access
         self.task_dict = {head.name: head for head in task_heads}
         
+        # Add task_names property for backward compatibility
+        self.task_names = [head.name for head in task_heads]
+        
+        # Add task_weights property for backward compatibility
+        self.task_weights = nn.ParameterDict({
+            head.name: nn.Parameter(torch.tensor(head.task_weight), requires_grad=False) 
+            for head in task_heads
+        })
+        
         # Variational components if enabled
         if include_variational:
             # Encoder for variational parameters (mean and log variance)
@@ -171,6 +180,10 @@ class MultiTaskManager(nn.Module):
                 nn.LayerNorm(encoder_dim),
                 nn.GELU()
             )
+            
+            # Add variational mu and logvar properties for backward compatibility
+            self.variational_mu = nn.Linear(encoder_dim, encoder_dim)
+            self.variational_logvar = nn.Linear(encoder_dim, encoder_dim)
     
     def forward(self, 
                x: torch.Tensor, 
@@ -234,25 +247,32 @@ class MultiTaskManager(nn.Module):
         task_losses = {}
         task_outputs = {}
         
+        # First, process tasks with targets
         for task_head in self.task_heads:
             task_name = task_head.name
             task_target = targets.get(task_name, None)
             task_mask = masks.get(task_name, None) if masks else None
             
-            # Skip if no targets provided for this task
-            if task_target is None:
-                continue
+            if task_target is not None:
+                # Forward pass through task head with targets
+                outputs = task_head(x, task_target, task_mask, sample_weights)
                 
-            # Forward pass through task head
-            outputs = task_head(x, task_target, task_mask, sample_weights)
+                # Extract and scale task loss
+                task_loss = outputs.get('loss', torch.tensor(0.0, device=device))
+                weighted_loss = task_loss * task_head.task_weight
+                
+                # Collect results
+                task_losses[task_name] = weighted_loss
+                task_outputs[task_name] = outputs
+        
+        # Now, run forward pass for tasks without targets
+        for task_head in self.task_heads:
+            task_name = task_head.name
             
-            # Extract and scale task loss
-            task_loss = outputs.get('loss', torch.tensor(0.0, device=device))
-            weighted_loss = task_loss * task_head.task_weight
-            
-            # Collect results
-            task_losses[task_name] = weighted_loss
-            task_outputs[task_name] = outputs
+            if task_name not in task_outputs:
+                # Forward pass without targets (prediction only)
+                outputs = task_head(x)
+                task_outputs[task_name] = outputs
             
         # Compute combined loss
         combined_loss = sum(task_losses.values()) + variational_loss
