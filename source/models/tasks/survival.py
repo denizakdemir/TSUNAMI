@@ -22,6 +22,8 @@ class SingleRiskHead(TaskHead):
                 alpha_calibration: float = 0.0,
                 task_weight: float = 1.0,
                 use_bce_loss: bool = True,
+                censored_weight: float = 1.0,
+                uncensored_weight: float = 1.0,
                 dropout: float = 0.1):
         """
         Initialize SingleRiskHead.
@@ -49,15 +51,40 @@ class SingleRiskHead(TaskHead):
         use_bce_loss : bool, default=True
             Whether to use binary cross-entropy loss (True) or negative log-likelihood (False)
             
+        censored_weight : float, default=1.0
+            Weight applied to censored samples in the loss
+            
+        uncensored_weight : float, default=1.0
+            Weight applied to uncensored (event) samples in the loss
+            
         dropout : float, default=0.1
             Dropout rate for the prediction network
         """
         super().__init__(name, input_dim, task_weight)
+
+        # --- Input Validation ---
+        assert isinstance(name, str) and name, "'name' must be a non-empty string"
+        assert isinstance(input_dim, int) and input_dim > 0, "'input_dim' must be a positive integer"
+        assert isinstance(num_time_bins, int) and num_time_bins > 0, "'num_time_bins' must be a positive integer"
+        assert isinstance(alpha_rank, float) and alpha_rank >= 0.0, "'alpha_rank' must be a non-negative float"
+        assert isinstance(alpha_calibration, float) and alpha_calibration >= 0.0, "'alpha_calibration' must be a non-negative float"
+        assert isinstance(task_weight, float) and task_weight >= 0.0, "'task_weight' must be a non-negative float"
+        assert isinstance(use_bce_loss, bool), "'use_bce_loss' must be a boolean"
+        assert isinstance(censored_weight, float) and censored_weight >= 0.0, "'censored_weight' must be a non-negative float"
+        assert isinstance(uncensored_weight, float) and uncensored_weight >= 0.0, "'uncensored_weight' must be a non-negative float"
+        assert isinstance(dropout, float) and 0.0 <= dropout < 1.0, "'dropout' must be a float between 0.0 and 1.0"
+        # --- End Input Validation ---
         
         self.num_time_bins = num_time_bins
         self.alpha_rank = alpha_rank
         self.alpha_calibration = alpha_calibration
         self.use_bce_loss = use_bce_loss
+        self.censored_weight = censored_weight
+        self.uncensored_weight = uncensored_weight
+        
+        # Temperature scaling parameter (learnable)
+        # Initialize raw_temperature to 0.0, so actual temperature starts near log(2) ~ 0.69
+        self.raw_temperature = nn.Parameter(torch.zeros(1)) 
         
         # Architecture
         self.prediction_network = nn.Sequential(
@@ -221,8 +248,13 @@ class SingleRiskHead(TaskHead):
         batch_size = x.size(0)
         device = x.device
         
-        # Compute raw predictions (log hazards)
-        log_hazards = self.prediction_network(x)
+        # Compute raw predictions (logits)
+        logits = self.prediction_network(x)
+        
+        # Apply temperature scaling
+        # Use softplus to ensure temperature is positive, add epsilon for stability
+        temperature = F.softplus(self.raw_temperature) + 1e-6 
+        log_hazards = logits / temperature # Apply temperature scaling to logits
         
         # Check for NaN values in log_hazards
         if torch.isnan(log_hazards).any():
@@ -328,18 +360,23 @@ class SingleRiskHead(TaskHead):
                         weighted_bce_mask = torch.zeros_like(bce_mask)
                         for i in range(batch_size):
                             weighted_bce_mask[i] = bce_mask[i] * sample_weights[i]
-                        bce_mask = weighted_bce_mask
-                    
-                    # Compute BCE loss
-                    bce_loss = F.binary_cross_entropy(
-                        hazards, 
-                        bce_targets, 
+                        bce_mask = weighted_bce_mask # This now includes sample_weights if provided
+
+                    # Compute BCE loss using logits for numerical stability
+                    bce_loss = F.binary_cross_entropy_with_logits(
+                        log_hazards,  # Use raw logits
+                        bce_targets,
                         reduction='none'
                     )
-                    
-                    # Apply mask and normalize
-                    bce_loss = torch.sum(bce_loss * bce_mask) / (torch.sum(bce_mask) + 1e-6)
-                    loss = bce_loss
+
+                    # Create event-specific weights
+                    event_weights = torch.where(event_indicator > 0, self.uncensored_weight, self.censored_weight)
+                    event_weights = event_weights.unsqueeze(-1).expand_as(bce_loss) # Expand to match loss shape
+
+                    # Apply combined mask (original bce_mask * event_weights) and normalize
+                    combined_mask_weights = bce_mask * event_weights
+                    weighted_bce_loss = torch.sum(bce_loss * combined_mask_weights) / (torch.sum(combined_mask_weights) + 1e-6)
+                    loss = weighted_bce_loss
                 else:
                     # Negative log-likelihood loss (Discrete-time NLL)
                     # L = - sum_{i=1}^N [ delta_i * log(h_i(t_i)) + sum_{j=1}^{t_i-1} log(1 - h_i(j)) ]
@@ -349,7 +386,7 @@ class SingleRiskHead(TaskHead):
                     # For censored events (delta_i=0): - [sum_{j=1}^{t_i} log(1 - h_i(j))]
                     
                     # Compute log terms with extra safety for numerical stability
-                    epsilon = 1e-7
+                    epsilon = 1e-7 # Reverted epsilon change for NLL part
                     hazards_safe = torch.clamp(hazards, epsilon, 1.0 - epsilon) 
                     log_hazard = torch.log(hazards_safe)
                     log_1_minus_hazard = torch.log(1 - hazards_safe)
@@ -372,11 +409,16 @@ class SingleRiskHead(TaskHead):
                             else:  # Censored
                                 # Add sum of log(1-hazard) up to censoring time
                                 nll[i] = -torch.sum(log_1_minus_hazard[i, :t])
-                    
+
+                    # Create event-specific weights
+                    event_weights = torch.where(event_indicator > 0, self.uncensored_weight, self.censored_weight)
+
                     # Compute weighted mean NLL for valid samples
-                    weighted_nll = nll * combined_weights
-                    nll = torch.sum(weighted_nll) / (torch.sum(combined_weights) + 1e-6)
-                    loss = nll
+                    # combined_weights already includes mask and optional sample_weights
+                    final_weights = combined_weights * event_weights
+                    weighted_nll = nll * final_weights
+                    nll_loss = torch.sum(weighted_nll) / (torch.sum(final_weights) + 1e-6)
+                    loss = nll_loss
                 
                 # Add ranking loss if alpha_rank > 0
                 if self.alpha_rank > 0:
@@ -792,7 +834,11 @@ class SingleRiskHead(TaskHead):
             'num_time_bins': self.num_time_bins,
             'alpha_rank': self.alpha_rank,
             'alpha_calibration': self.alpha_calibration,
-            'use_bce_loss': self.use_bce_loss
+            'use_bce_loss': self.use_bce_loss,
+            'censored_weight': self.censored_weight,
+            'uncensored_weight': self.uncensored_weight,
+            # Note: Temperature is learned, not configured directly, but we can save its initial state if needed.
+            # 'initial_temperature': F.softplus(torch.zeros(1)).item() # Example if we wanted to save initial value
         })
         return config
 
@@ -815,6 +861,8 @@ class CompetingRisksHead(TaskHead):
                 task_weight: float = 1.0,
                 use_softmax: bool = True,
                 use_cause_specific: bool = True,
+                censored_weight: float = 1.0,
+                uncensored_weight: float = 1.0,
                 dropout: float = 0.1):
         """
         Initialize CompetingRisksHead.
@@ -850,10 +898,31 @@ class CompetingRisksHead(TaskHead):
             Whether to use cause-specific loss function (True) or
             subdistribution approach (False)
             
+        censored_weight : float, default=1.0
+            Weight applied to censored samples in the loss
+            
+        uncensored_weight : float, default=1.0
+            Weight applied to uncensored (event) samples in the loss
+            
         dropout : float, default=0.1
             Dropout rate for the prediction network
         """
         super().__init__(name, input_dim, task_weight)
+
+        # --- Input Validation ---
+        assert isinstance(name, str) and name, "'name' must be a non-empty string"
+        assert isinstance(input_dim, int) and input_dim > 0, "'input_dim' must be a positive integer"
+        assert isinstance(num_time_bins, int) and num_time_bins > 0, "'num_time_bins' must be a positive integer"
+        assert isinstance(num_risks, int) and num_risks > 0, "'num_risks' must be a positive integer"
+        assert isinstance(alpha_rank, float) and alpha_rank >= 0.0, "'alpha_rank' must be a non-negative float"
+        assert isinstance(alpha_calibration, float) and alpha_calibration >= 0.0, "'alpha_calibration' must be a non-negative float"
+        assert isinstance(task_weight, float) and task_weight >= 0.0, "'task_weight' must be a non-negative float"
+        assert isinstance(use_softmax, bool), "'use_softmax' must be a boolean"
+        assert isinstance(use_cause_specific, bool), "'use_cause_specific' must be a boolean"
+        assert isinstance(censored_weight, float) and censored_weight >= 0.0, "'censored_weight' must be a non-negative float"
+        assert isinstance(uncensored_weight, float) and uncensored_weight >= 0.0, "'uncensored_weight' must be a non-negative float"
+        assert isinstance(dropout, float) and 0.0 <= dropout < 1.0, "'dropout' must be a float between 0.0 and 1.0"
+        # --- End Input Validation ---
         
         self.num_time_bins = num_time_bins
         self.num_risks = num_risks
@@ -861,6 +930,8 @@ class CompetingRisksHead(TaskHead):
         self.alpha_calibration = alpha_calibration
         self.use_softmax = use_softmax
         self.use_cause_specific = use_cause_specific
+        self.censored_weight = censored_weight
+        self.uncensored_weight = uncensored_weight
         
         # Architecture
         # For competing risks, we need to predict hazards for each risk at each time
@@ -1343,18 +1414,24 @@ class CompetingRisksHead(TaskHead):
                         weighted_bce_mask = torch.zeros_like(bce_mask)
                         for i in range(batch_size):
                             weighted_bce_mask[i] = bce_mask[i] * sample_weights[i]
-                        bce_mask = weighted_bce_mask
-                    
-                    # Compute BCE loss
-                    bce_loss = F.binary_cross_entropy(
-                        hazards, 
-                        bce_targets, 
+                        bce_mask = weighted_bce_mask # This now includes sample_weights if provided
+
+                    # Compute BCE loss using logits for numerical stability
+                    bce_loss = F.binary_cross_entropy_with_logits(
+                        log_hazards,  # Use raw logits
+                        bce_targets,
                         reduction='none'
                     )
-                    
-                    # Apply mask and normalize
-                    bce_loss = torch.sum(bce_loss * bce_mask) / (torch.sum(bce_mask) + 1e-6)
-                    loss = bce_loss
+
+                    # Create event-specific weights (applied per sample, not per risk/time)
+                    event_weights = torch.where(event_indicator > 0, self.uncensored_weight, self.censored_weight)
+                    # Expand weights to match loss shape [batch, risk, time]
+                    event_weights = event_weights.unsqueeze(-1).unsqueeze(-1).expand_as(bce_loss)
+
+                    # Apply combined mask (original bce_mask * event_weights) and normalize
+                    combined_mask_weights = bce_mask * event_weights
+                    weighted_bce_loss = torch.sum(bce_loss * combined_mask_weights) / (torch.sum(combined_mask_weights) + 1e-6)
+                    loss = weighted_bce_loss
                 else:
                     # Fine-Gray subdistribution Negative Log-Likelihood
                     # L = - sum_{i=1}^N [ delta_i * I(cause_i=k) * (log(h_{ik}(t_i)) + log(S_i(t_i-1))) + (1 - delta_i) * log(S_i(t_i)) ]
@@ -1375,7 +1452,7 @@ class CompetingRisksHead(TaskHead):
                                 c = cause[i]  # Which cause
                                 
                                 # Add log hazard for specific cause at event time
-                                epsilon = 1e-7
+                                epsilon = 1e-7 # Reverted epsilon change for NLL part
                                 hazard_c_t = torch.clamp(hazards[i, c, t], epsilon, 1.0 - epsilon)
                                 nll[i] = -torch.log(hazard_c_t)
                                 
@@ -1385,14 +1462,20 @@ class CompetingRisksHead(TaskHead):
                                     nll[i] -= torch.log(prev_surv)
                             else:  # Censored
                                 # Add log probability of not experiencing any event by censoring time
+                                epsilon = 1e-7 # Reverted epsilon change for NLL part
                                 if t > 0:
                                     surv_t = torch.clamp(overall_survival[i, t-1], epsilon, 1.0)
                                     nll[i] = -torch.log(surv_t)
-                    
+
+                    # Create event-specific weights
+                    event_weights = torch.where(event_indicator > 0, self.uncensored_weight, self.censored_weight)
+
                     # Compute weighted mean NLL for valid samples
-                    weighted_nll = nll * combined_weights
-                    nll = torch.sum(weighted_nll) / (torch.sum(combined_weights) + 1e-6)
-                    loss = nll
+                    # combined_weights already includes mask and optional sample_weights
+                    final_weights = combined_weights * event_weights
+                    weighted_nll = nll * final_weights
+                    nll_loss = torch.sum(weighted_nll) / (torch.sum(final_weights) + 1e-6)
+                    loss = nll_loss
                 
                 # Add ranking loss if alpha_rank > 0
                 if self.alpha_rank > 0:
@@ -1772,6 +1855,8 @@ class CompetingRisksHead(TaskHead):
             'alpha_rank': self.alpha_rank,
             'alpha_calibration': self.alpha_calibration,
             'use_softmax': self.use_softmax,
-            'use_cause_specific': self.use_cause_specific
+            'use_cause_specific': self.use_cause_specific,
+            'censored_weight': self.censored_weight,
+            'uncensored_weight': self.uncensored_weight
         })
         return config

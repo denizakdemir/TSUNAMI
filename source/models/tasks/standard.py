@@ -44,6 +44,17 @@ class ClassificationHead(TaskHead):
             Weight of this task in the multi-task loss
         """
         super().__init__(name, input_dim, task_weight)
+
+        # --- Input Validation ---
+        assert isinstance(name, str) and name, "'name' must be a non-empty string"
+        assert isinstance(input_dim, int) and input_dim > 0, "'input_dim' must be a positive integer"
+        assert isinstance(num_classes, int) and num_classes >= 1, "'num_classes' must be at least 1 (use 2 for binary)"
+        if class_weights is not None:
+            assert isinstance(class_weights, list) and len(class_weights) == num_classes, f"'class_weights' must be a list of length {num_classes}"
+            assert all(isinstance(w, (int, float)) and w >= 0 for w in class_weights), "'class_weights' must contain non-negative numbers"
+        assert isinstance(dropout, float) and 0.0 <= dropout < 1.0, "'dropout' must be a float between 0.0 and 1.0"
+        assert isinstance(task_weight, float) and task_weight >= 0.0, "'task_weight' must be a non-negative float"
+        # --- End Input Validation ---
         
         self.num_classes = num_classes
         self.class_weights = class_weights
@@ -415,6 +426,18 @@ class RegressionHead(TaskHead):
             Weight of this task in the multi-task loss
         """
         super().__init__(name, input_dim, task_weight)
+
+        # --- Input Validation ---
+        assert isinstance(name, str) and name, "'name' must be a non-empty string"
+        assert isinstance(input_dim, int) and input_dim > 0, "'input_dim' must be a positive integer"
+        assert isinstance(output_dim, int) and output_dim > 0, "'output_dim' must be a positive integer"
+        if quantiles is not None:
+            assert isinstance(quantiles, list) and all(isinstance(q, float) and 0 < q < 1 for q in quantiles), "'quantiles' must be a list of floats between 0 and 1"
+            assert loss_type == 'quantile', "loss_type must be 'quantile' when quantiles are provided"
+        assert loss_type in ['mse', 'mae', 'huber', 'quantile'], "loss_type must be one of 'mse', 'mae', 'huber', 'quantile'"
+        assert isinstance(dropout, float) and 0.0 <= dropout < 1.0, "'dropout' must be a float between 0.0 and 1.0"
+        assert isinstance(task_weight, float) and task_weight >= 0.0, "'task_weight' must be a non-negative float"
+        # --- End Input Validation ---
         
         self.output_dim = output_dim
         self.quantiles = quantiles
@@ -841,6 +864,16 @@ class CountDataHead(TaskHead):
             Weight of this task in the multi-task loss
         """
         super().__init__(name, input_dim, task_weight)
+
+        # --- Input Validation ---
+        assert isinstance(name, str) and name, "'name' must be a non-empty string"
+        assert isinstance(input_dim, int) and input_dim > 0, "'input_dim' must be a positive integer"
+        assert distribution in ['poisson', 'negative_binomial'], "distribution must be 'poisson' or 'negative_binomial'"
+        assert isinstance(exposure, bool), "'exposure' must be a boolean"
+        assert isinstance(zero_inflated, bool), "'zero_inflated' must be a boolean"
+        assert isinstance(dropout, float) and 0.0 <= dropout < 1.0, "'dropout' must be a float between 0.0 and 1.0"
+        assert isinstance(task_weight, float) and task_weight >= 0.0, "'task_weight' must be a non-negative float"
+        # --- End Input Validation ---
         
         self.distribution = distribution
         self.exposure = exposure

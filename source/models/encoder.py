@@ -522,7 +522,8 @@ class TabularTransformer(nn.Module):
                 embedding_dropout: float = 0.1,
                 feature_interaction: bool = True,
                 missing_value_embed: bool = True,
-                pool: str = 'attention'):
+                pool: str = 'attention',
+                feature_dropout: float = 0.0): # Added feature dropout
         """
         Initialize TabularTransformer.
         
@@ -563,6 +564,9 @@ class TabularTransformer(nn.Module):
             
         pool : str, default='attention'
             Pooling method ('mean', 'attention', or 'cls')
+            
+        feature_dropout : float, default=0.0
+            Dropout rate applied to the entire feature embedding after positional encoding.
         """
         super().__init__()
         
@@ -573,8 +577,9 @@ class TabularTransformer(nn.Module):
         self.heads = heads
         self.feature_interaction = feature_interaction
         self.pool = pool
-        self.ff_dim = ff_dim  # Store for configuration saving
-        self.attn_dropout = attn_dropout  # Store for configuration saving
+        self.ff_dim = ff_dim
+        self.attn_dropout = attn_dropout
+        self.feature_dropout_rate = feature_dropout # Store feature dropout rate
         
         # Calculate total number of features
         self.num_categorical = len(self.cat_feat_info)
@@ -618,6 +623,9 @@ class TabularTransformer(nn.Module):
         if pool == 'cls':
             self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
             self.cls_pos = nn.Parameter(torch.randn(1, 1, dim))
+
+        # Feature dropout layer
+        self.feature_dropout = nn.Dropout(feature_dropout)
             
         # Final normalization
         self.norm = nn.LayerNorm(dim)
@@ -663,6 +671,9 @@ class TabularTransformer(nn.Module):
         
         # Add positional embedding
         x = x + self.positional_embedding
+
+        # Apply feature dropout
+        x = self.feature_dropout(x)
         
         # Add CLS token if using cls pooling
         if self.pool == 'cls':

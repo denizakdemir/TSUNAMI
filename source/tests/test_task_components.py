@@ -390,7 +390,7 @@ class TestTaskHeads:
             name='multiclass',
             input_dim=encoder_dim,
             num_classes=num_classes,
-            class_weights=torch.ones(num_classes)  # Equal weights
+            class_weights=[1.0] * num_classes  # Pass as list
         )
         
         # Check initialization

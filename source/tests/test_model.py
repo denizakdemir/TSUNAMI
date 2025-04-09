@@ -80,9 +80,13 @@ class TestEnhancedDeepHitModel:
             "regression": torch.ones(batch_size)
         }
         
-        # Create a missing data mask
-        missing_mask = torch.ones_like(continuous)
-        missing_mask[:5, :3] = 0  # Set some values as missing
+        # Create a missing data mask for all features (continuous + categorical)
+        num_total_features = num_features + len(cat_feat_info) # Should be 10 + 3 = 13
+        missing_mask = torch.zeros(batch_size, num_total_features, dtype=torch.float) # Start with no missing, shape (32, 13)
+        # Example: Make some continuous features missing for first 5 samples
+        missing_mask[:5, :3] = 1.0 # Mark first 3 continuous features as missing for first 5 samples
+        # Example: Make one categorical feature missing for next 5 samples
+        missing_mask[5:10, num_features] = 1.0 # Mark first categorical feature as missing for samples 5-9
         
         # Sample weights
         sample_weights = torch.ones(batch_size)

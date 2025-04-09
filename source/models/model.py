@@ -7,6 +7,7 @@ import os
 import json
 import logging
 from pathlib import Path
+from torch.cuda.amp import autocast, GradScaler
 
 from source.models.encoder import TabularTransformer
 from source.models.tasks.base import MultiTaskManager, TaskHead
@@ -22,7 +23,24 @@ class EnhancedDeepHit(nn.Module):
     - Tabular transformer architecture with categorical and continuous features
     - Missing data handling
     - Masked loss for incomplete targets
-    - Variational methods for uncertainty quantification
+    - Variational methods for uncertainty quantification (optional)
+
+    Attributes
+    ----------
+    encoder : TabularTransformer
+        The transformer-based encoder for processing input features.
+    task_manager : MultiTaskManager
+        Manages the different prediction heads (tasks).
+    num_continuous : int
+        Number of continuous input features.
+    cat_feat_info : List[Dict]
+        Information about categorical features (name, cardinality).
+    encoder_dim : int
+        Dimensionality of the encoder's output representation.
+    include_variational : bool
+        Flag indicating if variational inference components are included.
+    device : str
+        The device ('cpu' or 'cuda') the model is running on.
     """
     
     def __init__(self,
@@ -39,47 +57,58 @@ class EnhancedDeepHit(nn.Module):
                 variational_beta: float = 0.1,
                 device: str = 'cpu'):
         """
-        Initialize EnhancedDeepHit model.
-        
+        Initialize the EnhancedDeepHit model.
+
+        Configures the encoder architecture and the multi-task prediction heads.
+
         Parameters
         ----------
         num_continuous : int
-            Number of continuous features
-            
+            Number of continuous input features. Must be non-negative.
         targets : List[TaskHead]
-            List of task-specific heads
-            
+            A list containing initialized instances of task-specific heads
+            (e.g., SingleRiskHead, ClassificationHead). At least one head must be provided.
         cat_feat_info : List[Dict], optional
-            List of dictionaries with categorical feature information
-            
+            A list where each dictionary describes a categorical feature.
+            Expected keys: 'name' (str) and 'cardinality' (int). Defaults to None (no categorical features).
+            Example: [{'name': 'gender', 'cardinality': 2}, {'name': 'treatment', 'cardinality': 3}]
         encoder_dim : int, default=128
-            Dimension of the encoder representation
-            
+            The dimensionality of the embeddings and hidden layers within the transformer encoder. Must be positive.
         encoder_depth : int, default=4
-            Number of transformer layers in the encoder
-            
+            The number of transformer blocks (layers) in the encoder. Must be positive.
         encoder_heads : int, default=8
-            Number of attention heads in the encoder
-            
+            The number of attention heads in the multi-head self-attention mechanism of the encoder. Must be positive.
         encoder_ff_dim : int, default=512
-            Feed-forward hidden dimension in the encoder
-            
+            The dimensionality of the feed-forward network within each transformer block. Must be positive.
         encoder_dropout : float, default=0.1
-            Dropout rate in the encoder
-            
+            The dropout rate applied within the encoder (attention, feed-forward, embeddings). Must be between 0.0 and 1.0.
         encoder_feature_interaction : bool, default=True
-            Whether to use explicit feature interaction in the encoder
-            
+            If True, enables an explicit feature interaction layer within the encoder.
         include_variational : bool, default=False
-            Whether to include variational component for uncertainty
-            
+            If True, incorporates variational components into the task manager for uncertainty estimation.
         variational_beta : float, default=0.1
-            Weight of KL divergence in variational loss
-            
+            The weight applied to the KL divergence term in the loss when `include_variational` is True. Must be non-negative.
         device : str, default='cpu'
-            Device to use for computation ('cpu' or 'cuda')
+            The device ('cpu' or 'cuda') on which the model's parameters and computations should be placed.
         """
         super().__init__()
+
+        # --- Input Validation ---
+        assert isinstance(num_continuous, int) and num_continuous >= 0, "'num_continuous' must be a non-negative integer"
+        assert isinstance(targets, list) and all(isinstance(t, TaskHead) for t in targets), "'targets' must be a list of TaskHead instances"
+        assert len(targets) > 0, "At least one target TaskHead must be provided"
+        if cat_feat_info is not None:
+            assert isinstance(cat_feat_info, list) and all(isinstance(info, dict) for info in cat_feat_info), "'cat_feat_info' must be a list of dictionaries"
+        assert isinstance(encoder_dim, int) and encoder_dim > 0, "'encoder_dim' must be a positive integer"
+        assert isinstance(encoder_depth, int) and encoder_depth > 0, "'encoder_depth' must be a positive integer"
+        assert isinstance(encoder_heads, int) and encoder_heads > 0, "'encoder_heads' must be a positive integer"
+        assert isinstance(encoder_ff_dim, int) and encoder_ff_dim > 0, "'encoder_ff_dim' must be a positive integer"
+        assert isinstance(encoder_dropout, float) and 0.0 <= encoder_dropout < 1.0, "'encoder_dropout' must be a float between 0.0 and 1.0"
+        assert isinstance(encoder_feature_interaction, bool), "'encoder_feature_interaction' must be a boolean"
+        assert isinstance(include_variational, bool), "'include_variational' must be a boolean"
+        assert isinstance(variational_beta, float) and variational_beta >= 0.0, "'variational_beta' must be a non-negative float"
+        assert device in ['cpu', 'cuda'], "'device' must be either 'cpu' or 'cuda'"
+        # --- End Input Validation ---
         
         self.num_continuous = num_continuous
         self.cat_feat_info = cat_feat_info or []
@@ -122,38 +151,92 @@ class EnhancedDeepHit(nn.Module):
                missing_mask: Optional[torch.Tensor] = None,
                sample_weights: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
-        Forward pass through the EnhancedDeepHit model.
-        
+        Perform a forward pass through the encoder and task heads.
+
+        Processes input features through the TabularTransformer encoder and then
+        feeds the resulting representation to the MultiTaskManager to compute
+        task-specific outputs and, if targets are provided, the combined loss.
+
         Parameters
         ----------
         continuous : torch.Tensor
-            Continuous features [batch_size, num_continuous]
-            
+            A 2D tensor containing the continuous features for the batch.
+            Shape: `(batch_size, num_continuous)`.
         targets : Dict[str, torch.Tensor], optional
-            Dictionary mapping task names to target tensors
-            
+            A dictionary mapping task names (str) to their corresponding target tensors.
+            Required during training to compute the loss. Defaults to None.
+            The shape of each target tensor depends on the specific task head.
         masks : Dict[str, torch.Tensor], optional
-            Dictionary mapping task names to mask tensors
-            
+            A dictionary mapping task names (str) to 1D boolean or float tensors indicating
+            which samples in the batch have valid targets for that task.
+            Shape of each mask tensor: `(batch_size,)`. Defaults to None (all samples assumed valid).
         categorical : torch.Tensor, optional
-            Categorical features [batch_size, num_categorical]
-            
+            A 2D tensor containing the categorical features for the batch, represented as integer indices.
+            Shape: `(batch_size, num_categorical)`. Must have dtype `torch.long`. Defaults to None.
         missing_mask : torch.Tensor, optional
-            Missing value mask [batch_size, num_features]
-            
+            A 2D boolean or float tensor indicating missing values in the input features (continuous and categorical combined).
+            `True` or `1` indicates a missing value.
+            Shape: `(batch_size, num_continuous + num_categorical)`. Defaults to None.
         sample_weights : torch.Tensor, optional
-            Sample weights for weighted loss calculation [batch_size]
-            
+            A 1D tensor containing weights for each sample in the batch, used for weighted loss calculation.
+            Shape: `(batch_size,)`. Defaults to None.
+
         Returns
         -------
         Dict[str, Any]
-            Dictionary containing:
-            - 'loss': Combined loss if targets provided
-            - 'task_losses': Task-specific losses if targets provided
-            - 'task_outputs': Task-specific outputs
-            - 'encoder_output': Encoder representation
-            - 'attention_maps': Attention maps from encoder
+            A dictionary containing the results of the forward pass. Contents depend on whether `targets` were provided:
+            If `targets` is provided (training/evaluation):
+                - 'loss': The total combined loss (scalar tensor).
+                - 'task_losses': A dictionary mapping task names to their individual losses.
+                - 'task_outputs': A dictionary mapping task names to their respective output dictionaries (e.g., containing 'hazard', 'survival', 'predictions').
+                - 'encoder_output': The output representation from the encoder. Shape: `(batch_size, encoder_dim)`.
+                - 'attention_maps': Attention maps from the encoder's self-attention layers (if configured).
+                - 'variational_loss': KL divergence loss if `include_variational` is True.
+            If `targets` is None (prediction):
+                - 'task_outputs': A dictionary mapping task names to their respective prediction dictionaries.
+                - 'encoder_output': The output representation from the encoder.
+                - 'attention_maps': Attention maps from the encoder.
         """
+        # --- Input Validation ---
+        assert isinstance(continuous, torch.Tensor), "Input 'continuous' must be a torch.Tensor"
+        batch_size = continuous.size(0)
+        assert continuous.ndim == 2, f"Input 'continuous' must be 2D (batch_size, num_continuous), got {continuous.ndim}D"
+        assert continuous.size(1) == self.num_continuous, f"Input 'continuous' has incorrect number of features: expected {self.num_continuous}, got {continuous.size(1)}"
+
+        if categorical is not None:
+            assert isinstance(categorical, torch.Tensor), "Input 'categorical' must be a torch.Tensor"
+            assert categorical.ndim == 2, f"Input 'categorical' must be 2D (batch_size, num_categorical), got {categorical.ndim}D"
+            assert categorical.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'categorical' ({categorical.size(0)})"
+            assert categorical.size(1) == len(self.cat_feat_info), f"Input 'categorical' has incorrect number of features: expected {len(self.cat_feat_info)}, got {categorical.size(1)}"
+            assert categorical.dtype == torch.long, f"Input 'categorical' must have dtype torch.long, got {categorical.dtype}"
+
+        if missing_mask is not None:
+            assert isinstance(missing_mask, torch.Tensor), "Input 'missing_mask' must be a torch.Tensor"
+            assert missing_mask.ndim == 2, f"Input 'missing_mask' must be 2D (batch_size, num_features), got {missing_mask.ndim}D"
+            assert missing_mask.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'missing_mask' ({missing_mask.size(0)})"
+            expected_features = self.num_continuous + len(self.cat_feat_info)
+            assert missing_mask.size(1) == expected_features, f"Input 'missing_mask' has incorrect number of features: expected {expected_features}, got {missing_mask.size(1)}"
+
+        if sample_weights is not None:
+            assert isinstance(sample_weights, torch.Tensor), "Input 'sample_weights' must be a torch.Tensor"
+            assert sample_weights.ndim == 1, f"Input 'sample_weights' must be 1D (batch_size), got {sample_weights.ndim}D"
+            assert sample_weights.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'sample_weights' ({sample_weights.size(0)})"
+
+        if targets is not None:
+            assert isinstance(targets, dict), "Input 'targets' must be a dictionary"
+            for task_name, target_tensor in targets.items():
+                assert isinstance(target_tensor, torch.Tensor), f"Target for task '{task_name}' must be a torch.Tensor"
+                assert target_tensor.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and target '{task_name}' ({target_tensor.size(0)})"
+                # Specific shape checks might be needed per task, but basic batch size check is crucial
+
+        if masks is not None:
+            assert isinstance(masks, dict), "Input 'masks' must be a dictionary"
+            for task_name, mask_tensor in masks.items():
+                assert isinstance(mask_tensor, torch.Tensor), f"Mask for task '{task_name}' must be a torch.Tensor"
+                assert mask_tensor.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and mask '{task_name}' ({mask_tensor.size(0)})"
+                assert mask_tensor.ndim == 1, f"Mask for task '{task_name}' must be 1D (batch_size), got {mask_tensor.ndim}D"
+        # --- End Input Validation ---
+
         # Get encoder representation
         encoder_output, attention_maps = self.encoder(
             continuous=continuous,
@@ -204,33 +287,59 @@ class EnhancedDeepHit(nn.Module):
                return_representations: bool = False,
                return_attention: bool = False) -> Dict[str, Any]:
         """
-        Generate predictions from the model.
-        
+        Generate predictions for all tasks without computing loss.
+
+        Sets the model to evaluation mode and performs a forward pass without gradients.
+
         Parameters
         ----------
         continuous : torch.Tensor
-            Continuous features [batch_size, num_continuous]
-            
+            Continuous features. Shape: `(batch_size, num_continuous)`.
         categorical : torch.Tensor, optional
-            Categorical features [batch_size, num_categorical]
-            
+            Categorical features. Shape: `(batch_size, num_categorical)`. Defaults to None.
         missing_mask : torch.Tensor, optional
-            Missing value mask [batch_size, num_features]
-            
+            Missing value mask. Shape: `(batch_size, num_features)`. Defaults to None.
         sample_weights : torch.Tensor, optional
-            Sample weights [batch_size]
-            
+            Sample weights (currently unused in prediction but included for consistency). Shape: `(batch_size,)`. Defaults to None.
         return_representations : bool, default=False
-            Whether to return encoder representations
-            
+            If True, includes the encoder's output representation in the results dictionary under the key 'encoder_output'.
         return_attention : bool, default=False
-            Whether to return attention maps
-            
+            If True, includes the attention maps from the encoder in the results dictionary under the key 'attention_maps'.
+
         Returns
         -------
         Dict[str, Any]
-            Dictionary containing task predictions
+            A dictionary containing the prediction results:
+            - 'task_outputs': Dictionary mapping task names to their prediction dictionaries.
+            - 'encoder_output': (Optional) Encoder representation if `return_representations` is True.
+            - 'attention_maps': (Optional) Encoder attention maps if `return_attention` is True.
         """
+        # --- Input Validation ---
+        assert isinstance(continuous, torch.Tensor), "Input 'continuous' must be a torch.Tensor"
+        batch_size = continuous.size(0)
+        assert continuous.ndim == 2, f"Input 'continuous' must be 2D (batch_size, num_continuous), got {continuous.ndim}D"
+        assert continuous.size(1) == self.num_continuous, f"Input 'continuous' has incorrect number of features: expected {self.num_continuous}, got {continuous.size(1)}"
+
+        if categorical is not None:
+            assert isinstance(categorical, torch.Tensor), "Input 'categorical' must be a torch.Tensor"
+            assert categorical.ndim == 2, f"Input 'categorical' must be 2D (batch_size, num_categorical), got {categorical.ndim}D"
+            assert categorical.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'categorical' ({categorical.size(0)})"
+            assert categorical.size(1) == len(self.cat_feat_info), f"Input 'categorical' has incorrect number of features: expected {len(self.cat_feat_info)}, got {categorical.size(1)}"
+            assert categorical.dtype == torch.long, f"Input 'categorical' must have dtype torch.long, got {categorical.dtype}"
+
+        if missing_mask is not None:
+            assert isinstance(missing_mask, torch.Tensor), "Input 'missing_mask' must be a torch.Tensor"
+            assert missing_mask.ndim == 2, f"Input 'missing_mask' must be 2D (batch_size, num_features), got {missing_mask.ndim}D"
+            assert missing_mask.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'missing_mask' ({missing_mask.size(0)})"
+            expected_features = self.num_continuous + len(self.cat_feat_info)
+            assert missing_mask.size(1) == expected_features, f"Input 'missing_mask' has incorrect number of features: expected {expected_features}, got {missing_mask.size(1)}"
+
+        if sample_weights is not None:
+            assert isinstance(sample_weights, torch.Tensor), "Input 'sample_weights' must be a torch.Tensor"
+            assert sample_weights.ndim == 1, f"Input 'sample_weights' must be 1D (batch_size), got {sample_weights.ndim}D"
+            assert sample_weights.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'sample_weights' ({sample_weights.size(0)})"
+        # --- End Input Validation ---
+
         # Set model to evaluation mode
         self.eval()
         
@@ -287,6 +396,29 @@ class EnhancedDeepHit(nn.Module):
             - 'std': Standard deviation
             - 'samples': Individual samples
         """
+        # --- Input Validation ---
+        assert isinstance(continuous, torch.Tensor), "Input 'continuous' must be a torch.Tensor"
+        batch_size = continuous.size(0)
+        assert continuous.ndim == 2, f"Input 'continuous' must be 2D (batch_size, num_continuous), got {continuous.ndim}D"
+        assert continuous.size(1) == self.num_continuous, f"Input 'continuous' has incorrect number of features: expected {self.num_continuous}, got {continuous.size(1)}"
+
+        if categorical is not None:
+            assert isinstance(categorical, torch.Tensor), "Input 'categorical' must be a torch.Tensor"
+            assert categorical.ndim == 2, f"Input 'categorical' must be 2D (batch_size, num_categorical), got {categorical.ndim}D"
+            assert categorical.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'categorical' ({categorical.size(0)})"
+            assert categorical.size(1) == len(self.cat_feat_info), f"Input 'categorical' has incorrect number of features: expected {len(self.cat_feat_info)}, got {categorical.size(1)}"
+            assert categorical.dtype == torch.long, f"Input 'categorical' must have dtype torch.long, got {categorical.dtype}"
+
+        if missing_mask is not None:
+            assert isinstance(missing_mask, torch.Tensor), "Input 'missing_mask' must be a torch.Tensor"
+            assert missing_mask.ndim == 2, f"Input 'missing_mask' must be 2D (batch_size, num_features), got {missing_mask.ndim}D"
+            assert missing_mask.size(0) == batch_size, f"Batch size mismatch between 'continuous' ({batch_size}) and 'missing_mask' ({missing_mask.size(0)})"
+            expected_features = self.num_continuous + len(self.cat_feat_info)
+            assert missing_mask.size(1) == expected_features, f"Input 'missing_mask' has incorrect number of features: expected {expected_features}, got {missing_mask.size(1)}"
+        
+        assert isinstance(num_samples, int) and num_samples > 0, "Input 'num_samples' must be a positive integer"
+        # --- End Input Validation ---
+
         # Set model to training mode to enable dropout
         self.train()
         
@@ -367,47 +499,56 @@ class EnhancedDeepHit(nn.Module):
            callbacks: Optional[List[Any]] = None,
            use_sample_weights: bool = False) -> Dict[str, List[float]]:
         """
-        Train the model.
-        
+        Train the EnhancedDeepHit model using the provided data loaders and training configuration.
+
+        Implements a standard training loop with support for validation, early stopping based on
+        validation loss or a specified metric, learning rate scheduling, mixed precision (if CUDA is available),
+        and optional callbacks.
+
         Parameters
         ----------
         train_loader : torch.utils.data.DataLoader
-            DataLoader for training data
-            
+            DataLoader providing batches of training data. Each batch should be a dictionary
+            containing at least 'continuous' and 'targets'. Optional keys include 'categorical',
+            'missing_mask', 'masks', and 'sample_weights'.
         val_loader : torch.utils.data.DataLoader, optional
-            DataLoader for validation data
-            
+            DataLoader providing batches of validation data. Used for monitoring performance,
+            learning rate scheduling, and early stopping. Defaults to None.
         learning_rate : float, default=1e-3
-            Learning rate for optimizer
-            
+            The initial learning rate for the Adam optimizer.
         weight_decay : float, default=1e-4
-            Weight decay for optimizer
-            
+            The weight decay (L2 penalty) for the Adam optimizer.
         num_epochs : int, default=100
-            Maximum number of training epochs
-            
+            The maximum number of epochs to train for.
         patience : int, default=10
-            Patience for early stopping
-            
+            The number of epochs to wait for improvement in the validation metric before
+            early stopping. Only used if `val_loader` is provided.
         optimize_metric : str, optional
-            Metric to optimize for early stopping
-            
+            The name of the validation metric to monitor for early stopping (e.g., 'survival_task_c_index').
+            If None, validation loss is used. The metric name should match a key in the dictionary
+            returned by the `evaluate` method. Assumes higher values are better for the metric.
         callbacks : List[Any], optional
-            Callbacks for training process
-            
+            A list of callback functions or objects to be called at the end of each epoch.
+            Each callback will receive the model instance, the current epoch number, and a logs dictionary.
+            Defaults to None.
         use_sample_weights : bool, default=False
-            Whether to use sample weights from the batches (should be provided in the 'sample_weights' key)
-            
+            If True, the training loop will look for a 'sample_weights' key in the batches
+            provided by the data loaders and pass them to the forward pass for weighted loss calculation.
+
         Returns
         -------
         Dict[str, List[float]]
-            Training history
+            A dictionary containing the training history, including lists of training loss,
+            validation loss (if applicable), and any validation metrics recorded per epoch.
         """
         # Set model to training mode
         self.train()
         
         # Initialize optimizer
         optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        # Initialize GradScaler for mixed precision if CUDA is available
+        scaler = GradScaler() if self.device == 'cuda' else None
         
         # Initialize learning rate scheduler
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -458,25 +599,40 @@ class EnhancedDeepHit(nn.Module):
                 
                 # Zero gradients
                 optimizer.zero_grad()
+
+                # Forward pass with autocast if using CUDA
+                if scaler is not None:
+                    with autocast():
+                        outputs = self.forward(
+                            continuous=continuous,
+                            targets=targets,
+                            masks=masks,
+                            categorical=categorical,
+                            missing_mask=missing_mask,
+                            sample_weights=sample_weights
+                        )
+                        loss = outputs['loss']
+                else:
+                    # Standard forward pass if not using CUDA
+                    outputs = self.forward(
+                        continuous=continuous,
+                        targets=targets,
+                        masks=masks,
+                        categorical=categorical,
+                        missing_mask=missing_mask,
+                        sample_weights=sample_weights
+                    )
+                    loss = outputs['loss']
                 
-                # Forward pass
-                outputs = self.forward(
-                    continuous=continuous,
-                    targets=targets,
-                    masks=masks,
-                    categorical=categorical,
-                    missing_mask=missing_mask,
-                    sample_weights=sample_weights
-                )
-                
-                # Extract loss
-                loss = outputs['loss']
-                
-                # Backward pass
-                loss.backward()
-                
-                # Update weights
-                optimizer.step()
+                # Backward pass with scaler if using CUDA
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Standard backward pass and optimizer step
+                    loss.backward()
+                    optimizer.step()
                 
                 # Accumulate loss
                 train_loss += loss.item()
@@ -550,22 +706,26 @@ class EnhancedDeepHit(nn.Module):
     
     def evaluate(self, data_loader: torch.utils.data.DataLoader, use_sample_weights: bool = False) -> Tuple[float, Dict[str, float]]:
         """
-        Evaluate the model on a dataset.
-        
+        Evaluate the model's performance on a given dataset.
+
+        Sets the model to evaluation mode, iterates through the data loader, computes the loss,
+        and calculates task-specific metrics.
+
         Parameters
         ----------
         data_loader : torch.utils.data.DataLoader
-            DataLoader for evaluation data
-            
+            DataLoader providing batches of evaluation data. Each batch should be structured
+            similarly to the training data loader batches.
         use_sample_weights : bool, default=False
-            Whether to use sample weights from the batches
-            
+            If True, uses 'sample_weights' from the batches for loss calculation during evaluation.
+
         Returns
         -------
         Tuple[float, Dict[str, float]]
-            Tuple containing:
-            - Average loss
-            - Dictionary of evaluation metrics
+            A tuple containing:
+            - The average loss over the entire dataset (float).
+            - A dictionary mapping metric names (e.g., 'task_name_metric_name') to their
+              average values over the dataset (Dict[str, float]).
         """
         # Set model to evaluation mode
         self.eval()
