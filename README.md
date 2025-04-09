@@ -37,6 +37,22 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 python -m pip install -e .
 ```
 
+## Getting Started
+
+1.  **Install dependencies**: Ensure you are in the project's root directory and have activated your virtual environment. Then run:
+    ```bash
+    pip install -r requirements.txt
+    ```
+2.  **Run a basic example**: Execute the single-risk survival analysis example:
+    ```bash
+    python source/examples/single_risk_example.py
+    ```
+3.  **Explore the detailed walkthrough**: For a more comprehensive guide, open and run the Jupyter notebook:
+    ```
+    vignettes/getting_started.ipynb
+    ```
+    This notebook demonstrates the core features of TSUNAMI using the `ebmt3.csv` dataset included in the `vignettes` directory. Check the `vignettes/README.md` for more details on the original Python vignettes.
+
 ## Usage
 
 Here's a basic example of using TSUNAMI for survival analysis:
@@ -100,7 +116,7 @@ history = model.fit(
 predictions = model.predict(test_continuous, categorical=test_categorical)
 ```
 
-See the examples directory for more detailed usage examples:
+For more detailed usage examples and advanced features, explore the scripts in the `source/examples/` and `vignettes/` directories:
 - `source/examples/single_risk_example.py`: Single-risk survival analysis
 - `source/examples/competing_risks_example.py`: Competing risks survival analysis
 - `source/examples/multi_task_example.py`: Multi-task learning with survival, classification, and regression
