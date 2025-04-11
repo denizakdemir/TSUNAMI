@@ -17,7 +17,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/denizakdemir/TSUNAMI",
-    packages=find_packages(exclude=["tests*", "*.tests", "*.venv"]),
+    packages=find_packages(),
     include_package_data=True,
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -30,5 +30,5 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=requirements,
-    test_suite="source.tests",
+    test_suite="tsunami.tests",
 )
